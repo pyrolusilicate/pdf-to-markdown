@@ -1,0 +1,17 @@
+[project]
+name = "hackathon-gazprom-2026"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "doclayout-yolo>=0.0.4",
+    "huggingface-hub>=1.11.0",
+    "opencv-python>=4.13.0.92",
+    "pandas>=3.0.2",
+    "pillow>=12.2.0",
+    "pymupdf>=1.27.2.2",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "ultralytics>=8.4.38",
+]
