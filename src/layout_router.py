@@ -193,10 +193,10 @@ class LayoutRouter:
                 for box in sorted_boxes:
                     coords = [int(c) for c in box.xyxy[0].tolist()]
                     yolo_rect = fitz.Rect(
-                        coords[0] * (72 / 300),
-                        coords[1] * (72 / 300),
-                        coords[2] * (72 / 300),
-                        coords[3] * (72 / 300),
+                        coords[0] * (72 / 400),
+                        coords[1] * (72 / 400),
+                        coords[2] * (72 / 400),
+                        coords[3] * (72 / 400),
                     )
                     if (
                         yolo_rect.intersect(img_rect).get_area()
@@ -207,10 +207,10 @@ class LayoutRouter:
 
                 if not is_caught_by_yolo:
                     missed_coords = [
-                        int(img_rect.x0 * (300 / 72)),
-                        int(img_rect.y0 * (300 / 72)),
-                        int(img_rect.x1 * (300 / 72)),
-                        int(img_rect.y1 * (300 / 72)),
+                        int(img_rect.x0 * (400 / 72)),
+                        int(img_rect.y0 * (400 / 72)),
+                        int(img_rect.x1 * (400 / 72)),
+                        int(img_rect.y1 * (400 / 72)),
                     ]
 
                     missed_coords = [
