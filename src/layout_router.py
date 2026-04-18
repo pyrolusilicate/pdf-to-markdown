@@ -429,13 +429,30 @@ class LayoutRouter:
                         and get_ioa(b2400["coords"], coords_1280) > 0.8
                     ]
 
-                    # Если лупа нашла 2 или более таблиц внутри одной глобальной — берем их!
+                    # Если лупа нашла 2 или более таблиц внутри одной глобальной — проверяем её на вшивость!
                     if len(internal_boxes) >= 2:
-                        for internal in internal_boxes:
-                            final_boxes.append(internal["box_obj"])
-                            boxes_2400_parsed.remove(
-                                internal
-                            )  # Удаляем, чтобы не продублировать
+                        # --- ГЕОМЕТРИЧЕСКИЙ АУДИТ "ЛУПЫ" ---
+                        height_1280 = coords_1280[3] - coords_1280[1]
+                        width_1280 = coords_1280[2] - coords_1280[0]
+                        
+                        # 1. Считаем чистую высоту, которую реально покрывают куски от лупы
+                        covered_height = sum(b["coords"][3] - b["coords"][1] for b in internal_boxes)
+                        
+                        # 2. Проверяем ширину кусков (не обрезала ли лупа столбцы по краям)
+                        min_width_2400 = min(b["coords"][2] - b["coords"][0] for b in internal_boxes)
+                        
+                        coverage_ratio = covered_height / height_1280 if height_1280 > 0 else 0
+                        width_ratio = min_width_2400 / width_1280 if width_1280 > 0 else 0
+                        
+                        if coverage_ratio >= 0.98 and width_ratio > 0.945:
+                            # Лупа сработала идеально чисто, разрешаем распил
+                            for internal in internal_boxes:
+                                final_boxes.append(internal["box_obj"])
+                                if internal in boxes_2400_parsed:
+                                    boxes_2400_parsed.remove(internal)
+                        else:
+                            # Лупа потеряла данные по пути. Блокируем распил, доверяем Телескопу!
+                            final_boxes.append(b_1280)
                     else:
                         final_boxes.append(b_1280)
                 else:
