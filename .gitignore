@@ -3,6 +3,7 @@
 
 data/raw/*
 data/output/*
+data/visualization
 
 .cache
 __pycache__/

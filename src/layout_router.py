@@ -5,20 +5,22 @@ import os
 import cv2
 import fitz
 import numpy as np
+import torch
 from doclayout_yolo import YOLOv10
 from huggingface_hub import hf_hub_download
 from PIL import Image
 
 from device import get_torch_device, setup_environment
 
-import torch
-
 _original_load = torch.load
-torch.load = lambda *args, **kwargs: _original_load(*args, **{**kwargs, 'weights_only': False})
+torch.load = lambda *args, **kwargs: _original_load(
+    *args, **{**kwargs, "weights_only": False}
+)
 
 setup_environment()
 
 weights_name_file = "doclayout_yolo_docstructbench_imgsz1280_2501.pt"
+
 
 class LayoutRouter:
     def __init__(self, weights_dir: str = "weights"):
@@ -50,9 +52,7 @@ class LayoutRouter:
 
     def _load_model(self) -> YOLOv10:
         os.makedirs(self.weights_dir, exist_ok=True)
-        weights_path = os.path.join(
-            self.weights_dir, weights_name_file
-        )
+        weights_path = os.path.join(self.weights_dir, weights_name_file)
         if not os.path.exists(weights_path):
             hf_hub_download(
                 repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
@@ -68,7 +68,9 @@ class LayoutRouter:
         except ValueError:
             return base_name.replace(".pdf", "")
 
-    def _sort_reading_order(self, boxes: list, page_width: float, page_height: float) -> list:
+    def _sort_reading_order(
+        self, boxes: list, page_width: float, page_height: float
+    ) -> list:
         if not boxes:
             return []
 
@@ -85,7 +87,7 @@ class LayoutRouter:
                     "y2": coords[3],
                     "w": coords[2] - coords[0],
                     "h": coords[3] - coords[1],
-                    "cls": cls_name
+                    "cls": cls_name,
                 }
             )
 
@@ -112,49 +114,72 @@ class LayoutRouter:
         for i, b in enumerate(filtered_boxes):
             if i in used_indices:
                 continue
-                
+
             current_logical = [b]
             used_indices.add(i)
-            
+
             base_box = b
             for j in range(i + 1, len(filtered_boxes)):
                 if j in used_indices:
                     continue
                 next_box = filtered_boxes[j]
-                
+
                 # Расстояние по вертикали
                 y_gap = next_box["y1"] - base_box["y2"]
-                
+
                 # Доля пересечения по X
-                overlap_x = max(0, min(base_box["x2"], next_box["x2"]) - max(base_box["x1"], next_box["x1"]))
+                overlap_x = max(
+                    0,
+                    min(base_box["x2"], next_box["x2"])
+                    - max(base_box["x1"], next_box["x1"]),
+                )
                 min_w = min(base_box["w"], next_box["w"])
                 x_ratio = overlap_x / min_w if min_w > 0 else 0
-                
-                is_parent_media = base_box["cls"] in ["figure", "picture", "image", "table", "table_merged", "table_borderless"]
+
+                is_parent_media = base_box["cls"] in [
+                    "figure",
+                    "picture",
+                    "image",
+                    "table",
+                    "table_merged",
+                    "table_borderless",
+                ]
                 # Расширяем: клеим и caption, и обычный текст, если он явно работает как подпись
-                is_valid_child = next_box["cls"] in ["figure_caption", "table_caption", "caption", "text", "plain text"]
-                
+                is_valid_child = next_box["cls"] in [
+                    "figure_caption",
+                    "table_caption",
+                    "caption",
+                    "text",
+                    "plain text",
+                ]
+
                 # Если блок находится близко под картинкой/таблицей и сильно выровнен по ширине
                 if y_gap < page_height * 0.08 and x_ratio > 0.5:
                     if is_parent_media and is_valid_child:
                         current_logical.append(next_box)
                         used_indices.add(j)
-                        base_box = next_box # Сдвигаем низ для возможной многострочной подписи
+                        base_box = (
+                            next_box  # Сдвигаем низ для возможной многострочной подписи
+                        )
                     else:
-                        break # Обычные абзацы не склеиваем жестко
+                        break  # Обычные абзацы не склеиваем жестко
                 elif y_gap >= page_height * 0.08:
-                    pass # Ушли слишком далеко вниз
-                    
+                    pass  # Ушли слишком далеко вниз
+
             # Формируем габариты объединенного логического блока
-            logical_blocks.append({
-                "boxes": current_logical,
-                "x1": min(cb["x1"] for cb in current_logical),
-                "y1": min(cb["y1"] for cb in current_logical),
-                "x2": max(cb["x2"] for cb in current_logical),
-                "y2": max(cb["y2"] for cb in current_logical),
-                "w": max(cb["x2"] for cb in current_logical) - min(cb["x1"] for cb in current_logical),
-                "h": max(cb["y2"] for cb in current_logical) - min(cb["y1"] for cb in current_logical),
-            })
+            logical_blocks.append(
+                {
+                    "boxes": current_logical,
+                    "x1": min(cb["x1"] for cb in current_logical),
+                    "y1": min(cb["y1"] for cb in current_logical),
+                    "x2": max(cb["x2"] for cb in current_logical),
+                    "y2": max(cb["y2"] for cb in current_logical),
+                    "w": max(cb["x2"] for cb in current_logical)
+                    - min(cb["x1"] for cb in current_logical),
+                    "h": max(cb["y2"] for cb in current_logical)
+                    - min(cb["y1"] for cb in current_logical),
+                }
+            )
 
         # 3. Динамическое формирование колонок и полос (Bands)
         bands = []
@@ -309,7 +334,11 @@ class LayoutRouter:
             os.makedirs(vis_dir, exist_ok=True)
 
         doc = fitz.open(pdf_path)
-        routing_plan = {"doc_id": doc_id, "pdf_path": os.path.abspath(pdf_path), "pages": []}
+        routing_plan = {
+            "doc_id": doc_id,
+            "pdf_path": os.path.abspath(pdf_path),
+            "pages": [],
+        }
         global_image_counter = 1
 
         print(f"\nАнализ: {os.path.basename(pdf_path)} (ID: {doc_id})")
@@ -528,41 +557,49 @@ class LayoutRouter:
                     page_plan["blocks"].append(block)
 
             routing_plan["pages"].append(page_plan)
-        
+
             if visualize and vis_dir:
                 # Рисуем поверх оригинальной картинки
                 img_draw = img_cv2.copy()
-                
+
                 # Отдельный счетчик для валидных (не игнорируемых) блоков
-                valid_block_counter = 1 
-                
+                valid_block_counter = 1
+
                 for box in sorted_boxes:
                     label = self.model.names[int(box.cls[0])].lower()
-                    
+
                     # Пропускаем abandon и все остальные классы из ignore_classes
                     if label in self.ignore_classes:
                         continue
 
                     coords = [int(c) for c in box.xyxy[0].tolist()]
-                    
+
                     # Отрисовываем рамку (зеленая)
-                    cv2.rectangle(img_draw, (coords[0], coords[1]), (coords[2], coords[3]), (0, 255, 0), 2)
-                    
+                    cv2.rectangle(
+                        img_draw,
+                        (coords[0], coords[1]),
+                        (coords[2], coords[3]),
+                        (0, 255, 0),
+                        2,
+                    )
+
                     # Рисуем порядковый номер и класс блока (например: "1 (text)")
                     order_text = f"{valid_block_counter} ({label})"
                     cv2.putText(
-                        img_draw, 
-                        order_text, 
-                        (coords[0] + 5, coords[1] + 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.8, # Немного уменьшили шрифт, чтобы влезло название класса
-                        (0, 0, 255), # Красный цвет (BGR)
-                        2 # Толщина линии
+                        img_draw,
+                        order_text,
+                        (coords[0] + 5, coords[1] + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,  # Немного уменьшили шрифт, чтобы влезло название класса
+                        (0, 0, 255),  # Красный цвет (BGR)
+                        2,  # Толщина линии
                     )
-                    
+
                     valid_block_counter += 1
-                
-                cv2.imwrite(os.path.join(vis_dir, f"page_{page_num + 1}_order.jpg"), img_draw)
+
+                cv2.imwrite(
+                    os.path.join(vis_dir, f"page_{page_num + 1}_order.jpg"), img_draw
+                )
 
         doc.close()
         return routing_plan

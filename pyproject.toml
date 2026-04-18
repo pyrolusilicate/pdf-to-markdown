@@ -1,23 +1,26 @@
 [project]
 name = "hackathon-gazprom-2026"
 version = "0.1.0"
-description = "Add your description here"
+description = "PDF → Markdown pipeline: DocLayout-YOLO + Docling (векторные таблицы) + DeepSeek-OCR-2 (растр)."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
-    "accelerate>=1.0.0",
-    "dill>=0.4.1",
+    # Layout detection
     "doclayout-yolo>=0.0.4",
-    "easyocr>=1.7.0",
-    "huggingface-hub>=1.11.0",
-    "opencv-python>=4.13.0.92",
-    "pandas>=3.0.2",
-    "pdfplumber>=0.11.0",
-    "pillow>=12.2.0",
-    "pymupdf>=1.27.2.2",
-    "qwen-vl-utils>=0.0.11",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
-    "transformers>=4.49.0",
     "ultralytics>=8.4.38",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "transformers>=4.50.0",
+    "tokenizers>=0.21.0",
+    "accelerate>=1.0.0",
+    "einops",
+    "addict",
+    "easydict",
+    "docling>=2.0.0",
+    "docling-core>=2.0.0",
+    "pymupdf>=1.24.0",
+    "pillow>=10.0.0",
+    "opencv-python>=4.9.0",
+    "numpy>=1.26.0",
+    "huggingface-hub>=0.24.0",
 ]
