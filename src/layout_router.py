@@ -319,8 +319,20 @@ class LayoutRouter:
             )
             pil_img = Image.fromarray(img_rgb)
 
+            # --- ВНЕДРЕНИЕ ОЧИСТКИ ОТ ШУМА ---
+            # 1. Медианный фильтр (идеально для перцового шума, ядро 3x3)
+            img_cv2_denoised = cv2.medianBlur(img_cv2, 3)
+            
+            # (Опционально) 2. Если страницы выглядят как плохие сканы с серым фоном,
+            # можно добавить адаптивную бинаризацию для повышения контраста перед YOLO:
+            # gray = cv2.cvtColor(img_cv2_denoised, cv2.COLOR_BGR2GRAY)
+            # thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+            # img_cv2_denoised = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+            # ---------------------------------
+
+            # Обрати внимание: предикт делаем на очищенном img_cv2_denoised!
             results = self.model.predict(
-                img_cv2, imgsz=1024, conf=0.2, device=self.device, verbose=False
+                img_cv2_denoised, imgsz=1024, conf=0.12, device=self.device, verbose=False
             )[0]
 
             if visualize and vis_dir:
