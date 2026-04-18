@@ -40,4 +40,8 @@ def setup_environment() -> None:
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    os.environ.setdefault("PYMUPDF_MESSAGE", "0")
     warnings.filterwarnings("ignore", message=r".*pin_memory.*MPS.*")
+    warnings.filterwarnings("ignore", message=r".*`do_sample` is set to `False`.*temperature.*")
+    warnings.filterwarnings("ignore", message=r".*temperature.*do_sample.*")
+    warnings.filterwarnings("ignore", message=r".*pymupdf_layout.*")

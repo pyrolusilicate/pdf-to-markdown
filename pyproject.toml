@@ -1,26 +1,52 @@
 [project]
 name = "hackathon-gazprom-2026"
 version = "0.1.0"
-description = "PDF → Markdown pipeline: DocLayout-YOLO + Docling (векторные таблицы) + DeepSeek-OCR-2 (растр)."
+description = "PDF → Markdown: DocLayout-YOLO + PyMuPDF + DeepSeek-OCR-2"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    # Layout detection
+    # Layout (YOLO)
     "doclayout-yolo>=0.0.4",
     "ultralytics>=8.4.38",
+
+    # DeepSeek-OCR-2 — жёсткий стек (требуется custom modeling через trust_remote_code).
+    # Более новые transformers/tokenizers ломают импорт LlamaFlashAttention2.
     "torch==2.6.0",
     "torchvision==0.21.0",
-    "transformers>=4.50.0",
-    "tokenizers>=0.21.0",
-    "accelerate>=1.0.0",
+    "transformers==4.46.3",
+    "tokenizers==0.20.3",
+    "accelerate>=0.26.0",
     "einops",
     "addict",
     "easydict",
-    "docling>=2.0.0",
-    "docling-core>=2.0.0",
+    # flash-attn ставится ОТДЕЛЬНО (только на CUDA):
+    #   pip install flash-attn==2.7.3 --no-build-isolation
+
+    # PDF и изображения (таблицы — PyMuPDF find_tables, без Docling)
     "pymupdf>=1.24.0",
     "pillow>=10.0.0",
     "opencv-python>=4.9.0",
     "numpy>=1.26.0",
+
+    # HuggingFace Hub
     "huggingface-hub>=0.24.0",
 ]
+
+# ---------------------------------------------------------------------------
+# Установка по платформам:
+#
+# --- CUDA (4090, Colab, сервер) ---
+#   conda create -n pipeline python=3.12 -y && conda activate pipeline
+#   pip install torch==2.6.0 torchvision==0.21.0 \
+#       --index-url https://download.pytorch.org/whl/cu124
+#   pip install -e .
+#   pip install flash-attn==2.7.3 --no-build-isolation
+#   python src/pipeline.py --all
+#
+# --- Mac (тест без VLM, только layout + vector) ---
+#   conda create -n pipeline python=3.12 -y && conda activate pipeline
+#   pip install torch==2.6.0 torchvision==0.21.0 \
+#       --index-url https://download.pytorch.org/whl/cpu
+#   pip install -e .
+#   python src/pipeline.py --pdf data/raw/document_001.pdf --no-vlm
+# ---------------------------------------------------------------------------

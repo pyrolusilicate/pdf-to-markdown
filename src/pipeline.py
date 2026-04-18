@@ -3,21 +3,19 @@
 
 Архитектура:
     Layout Engine  : DocLayout-YOLO (src/layout_router.py)
-    Vector Engine  : PyMuPDF (текст) + Docling (таблицы)
-    Raster Engine  : DeepSeek-OCR-2 (src/vlm_engine.py)
+    Vector Engine  : PyMuPDF (текст)
+    Raster Engine  : DeepSeek-OCR-2 (src/vlm_engine.py) — все таблицы через VLM
 
 Треки, в которые перераспределяются блоки YOLO после is_vector-анализа:
     VECTOR_TEXT  — текст/заголовок/список, поверх которого есть текстовый слой PDF
-    VECTOR_TABLE — table + текстовый слой (Docling)
     RASTER_TEXT  — текст/заголовок/список без текстового слоя (скан)
-    RASTER_TABLE — table без текстового слоя (DeepSeek → markdown)
+    RASTER_TABLE — любая таблица (DeepSeek → markdown)
     SMART_FIGURE — figure/picture/image: VLM-классификация → markdown/ocr/PNG
 
 Использование:
     python src/pipeline.py --all
     python src/pipeline.py --pdf data/raw/document_001.pdf
     python src/pipeline.py --all --no-vlm         # только векторные треки
-    python src/pipeline.py --all --no-docling     # VLM-фолбэк для всех таблиц
 """
 
 from __future__ import annotations
@@ -38,7 +36,6 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parent))
 
 from content_extractor import (
-    DoclingTableStore,
     collect_heading_sizes,
     detect_heading_level,
     extract_text_block,
@@ -69,11 +66,9 @@ class Pipeline:
         self,
         output_dir: str = OUTPUT_DIR,
         use_vlm: bool = True,
-        use_docling: bool = True,
     ):
         self.output_dir = output_dir
         self.use_vlm = use_vlm
-        self.use_docling = use_docling
 
         self.router = LayoutRouter()
 
@@ -102,14 +97,12 @@ class Pipeline:
 
         self._enrich_plan_with_tracks(plan, pdf_doc)
 
-        docling_store = self._build_docling_store(pdf_path, plan)
-
         heading_sizes = collect_heading_sizes(pdf_doc, plan)
 
         chunks: list[str] = []
         for page_data in plan["pages"]:
             chunks.append(
-                self._process_page(page_data, pdf_doc, heading_sizes, docling_store)
+                self._process_page(page_data, pdf_doc, heading_sizes)
             )
             # Очищаем VRAM между страницами (особенно важно на Colab/40GB).
             if self.vlm is not None:
@@ -169,35 +162,12 @@ class Pipeline:
                 block["is_vector"] = is_vec
 
                 if btype == "table":
-                    block["track"] = "VECTOR_TABLE" if is_vec else "RASTER_TABLE"
+                    block["track"] = "RASTER_TABLE"
                 elif btype in TEXT_LABELS:
                     block["track"] = "VECTOR_TEXT" if is_vec else "RASTER_TEXT"
                 else:
                     # Незнакомый label — обрабатываем как текст.
                     block["track"] = "VECTOR_TEXT" if is_vec else "RASTER_TEXT"
-
-    def _build_docling_store(
-        self, pdf_path: str, plan: dict
-    ) -> Optional[DoclingTableStore]:
-        """
-        Docling-конверт PDF запускается только если есть хотя бы одна VECTOR_TABLE.
-        На документах без векторных таблиц (сканы) он бесполезен и дорог.
-        """
-        if not self.use_docling:
-            return None
-
-        has_vector_table = any(
-            b["track"] == "VECTOR_TABLE" for p in plan["pages"] for b in p["blocks"]
-        )
-        if not has_vector_table:
-            return None
-
-        try:
-            print("  [Docling] Конверт документа для таблиц…")
-            return DoclingTableStore(pdf_path)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [Docling] недоступен: {exc}. Таблицы пойдут через VLM.")
-            return None
 
     # ------------------------------------------------------------------
     # Страница / блок
@@ -208,14 +178,11 @@ class Pipeline:
         page_data: dict,
         pdf_doc: fitz.Document,
         heading_sizes: list[float],
-        docling_store: Optional[DoclingTableStore],
     ) -> str:
         page_num = page_data["page_num"] - 1
         parts: list[str] = []
         for block in page_data["blocks"]:
-            md = self._process_block(
-                block, page_num, pdf_doc, heading_sizes, docling_store
-            )
+            md = self._process_block(block, page_num, pdf_doc, heading_sizes)
             if md and md.strip():
                 parts.append(md.strip())
         return "\n\n".join(parts)
@@ -226,7 +193,6 @@ class Pipeline:
         page_num: int,
         pdf_doc: fitz.Document,
         heading_sizes: list[float],
-        docling_store: Optional[DoclingTableStore],
     ) -> str:
         track = block["track"]
         btype = block["type"]
@@ -234,14 +200,6 @@ class Pipeline:
 
         if track == "VECTOR_TEXT":
             return self._vector_text(btype, coords, page_num, pdf_doc, heading_sizes)
-
-        if track == "VECTOR_TABLE":
-            if docling_store is not None:
-                md = docling_store.find(page_num + 1, coords)
-                if md:
-                    return md
-            # фолбэк на VLM — таблица есть, а Docling её не нашёл
-            return self._raster_table(page_num, coords, pdf_doc)
 
         if track == "RASTER_TABLE":
             return self._raster_table(page_num, coords, pdf_doc)
@@ -290,12 +248,13 @@ class Pipeline:
         if self.vlm is None:
             return ""
         img = render_block_image(pdf_doc, page_num, coords, dpi=VLM_RENDER_DPI)
-        text = self.vlm.free_ocr(img).strip()
+        # extract_markdown лучше справляется с русским и смешанными блоками,
+        # чем free_ocr (который оптимизирован под короткие блоки на латинице).
+        text = self.vlm.extract_markdown(img).strip()
         text = filter_noise_lines(text, min_chars=3)
         if not text:
             return ""
 
-        # Для сканов уровень заголовка эвристический: title → H1, section-header → H2.
         heading_level = 0
         if btype == "title":
             heading_level = 1
@@ -332,8 +291,17 @@ class Pipeline:
         if pil_img is None:
             pil_img = render_block_image(pdf_doc, page_num, coords, dpi=VLM_RENDER_DPI)
 
+        # Всегда сохраняем изображение — метрика проверяет наличие файла.
+        alt = "image"
+        if self.vlm is not None:
+            try:
+                alt = self.vlm.short_caption(pil_img) or "image"
+            except Exception:
+                pass
+        image_md = self._save_figure(pil_img, md_image_name, alt=alt)
+
         if self.vlm is None:
-            return self._save_figure(pil_img, md_image_name, alt="image")
+            return image_md
 
         kind = "picture"
         try:
@@ -345,21 +313,20 @@ class Pipeline:
             md = self.vlm.extract_markdown(pil_img).strip()
             md = _postprocess_table_markdown(md)
             if md:
-                return md
+                return md  # таблица — только markdown, без image-ссылки
 
+        # Для текста и рукописного — OCR через extract_markdown (лучше для русского).
         if kind in ("text", "handwritten"):
-            text = self.vlm.free_ocr(pil_img).strip()
-            text = filter_noise_lines(text, min_chars=3)
+            text = ""
+            try:
+                text = self.vlm.extract_markdown(pil_img).strip()
+                text = filter_noise_lines(text, min_chars=3)
+            except Exception:
+                pass
             if text:
-                return text
+                return f"{image_md}\n\n{text}"
 
-        # picture (или всё выше сломалось) → сохраняем PNG + русский alt
-        alt = "image"
-        try:
-            alt = self.vlm.short_caption(pil_img) or "image"
-        except Exception:
-            pass
-        return self._save_figure(pil_img, md_image_name, alt=alt)
+        return image_md
 
     def _save_figure(
         self,
@@ -411,33 +378,62 @@ class Pipeline:
 # ---------------------------------------------------------------------------
 
 
+_TD_RE = re.compile(r"<(td|th)([^>]*)>(.*?)</(td|th)>", re.S | re.I)
+_TR_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
+_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+
+
+def _parse_html_table(html: str) -> tuple[list[list[str]], int]:
+    """
+    Парсит HTML <table> в (rows, n_header_rows).
+    n_header_rows — количество строк, где все ячейки были <th>.
+    """
+    rows: list[list[str]] = []
+    n_header_rows = 0
+    for tr in _TR_RE.finditer(html):
+        cells = []
+        all_th = True
+        for td in _TD_RE.finditer(tr.group(1)):
+            tag = td.group(1).lower()
+            text = _TAG_STRIP_RE.sub("", td.group(3)).strip()
+            cells.append(text)
+            if tag != "th":
+                all_th = False
+        if cells:
+            rows.append(cells)
+            if all_th and len(rows) == n_header_rows + 1:
+                n_header_rows += 1
+    return rows, n_header_rows
+
+
 def _postprocess_table_markdown(md: str) -> str:
     """
-    DeepSeek-OCR обычно возвращает валидный markdown, но иногда:
-      - оставляет один «головной» ряд вместо multi-level;
-      - пропускает дубликаты merged-ячеек.
-    Парсим pipe-строки, прогоняем через общий форматтер (он сам мёржит
-    заголовки через `_` и forward-fill'ит пустые ячейки).
+    Нормализует вывод DeepSeek-OCR в pipe-markdown.
+    DeepSeek может вернуть HTML или pipe-markdown.
+    Прогоняем через format_table_markdown (forward_fill + multilevel headers).
     """
     if not md:
         return ""
 
-    lines = [l for l in md.splitlines() if l.strip().startswith("|")]
-    if len(lines) < 2:
-        return md.strip()
+    # Путь 1: HTML-таблица
+    if "<table" in md.lower():
+        rows, n_hdr = _parse_html_table(md)
+        if len(rows) >= 2:
+            return format_table_markdown(rows, n_header_rows=n_hdr) or md.strip()
 
-    rows: list[list[str]] = []
-    for line in lines:
-        if re.match(r"^\|\s*:?-{2,}", line):
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        rows.append(cells)
+    # Путь 2: pipe-markdown
+    lines = [ln for ln in md.splitlines() if ln.strip().startswith("|")]
+    if len(lines) >= 2:
+        rows = []
+        for ln in lines:
+            if re.match(r"^\|\s*:?-{2,}", ln):
+                continue
+            cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+            rows.append(cells)
+        if len(rows) >= 2:
+            return format_table_markdown(rows) or md.strip()
 
-    if len(rows) < 2:
-        return md.strip()
-
-    reformatted = format_table_markdown(rows)
-    return reformatted or md.strip()
+    return md.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +442,7 @@ def _postprocess_table_markdown(md: str) -> str:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="PDF → Markdown (YOLO + Docling + DeepSeek-OCR)"
+        description="PDF → Markdown (YOLO + PyMuPDF + DeepSeek-OCR)"
     )
     parser.add_argument("--pdf", type=str, help="Путь к одному PDF")
     parser.add_argument(
@@ -455,17 +451,11 @@ if __name__ == "__main__":
     parser.add_argument("--raw-dir", type=str, default="data/raw")
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR)
     parser.add_argument("--no-vlm", action="store_true", help="Отключить DeepSeek-OCR")
-    parser.add_argument(
-        "--no-docling",
-        action="store_true",
-        help="Отключить Docling (все таблицы через VLM)",
-    )
     args = parser.parse_args()
 
     pipeline = Pipeline(
         output_dir=args.output_dir,
         use_vlm=not args.no_vlm,
-        use_docling=not args.no_docling,
     )
 
     if args.all:

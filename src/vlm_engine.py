@@ -102,13 +102,19 @@ class VLMEngine:
         import torch
         from transformers import AutoModel, AutoTokenizer
 
-        print(f"  [VLM] Загрузка {self.model_id} на {self.device} (bfloat16)...")
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+        except ImportError:
+            attn_impl = "sdpa"
+
+        print(f"  [VLM] Загрузка {self.model_id} на {self.device} (bfloat16, attn={attn_impl})...")
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.model_id, trust_remote_code=True
         )
         model = AutoModel.from_pretrained(
             self.model_id,
-            _attn_implementation="flash_attention_2",
+            _attn_implementation=attn_impl,
             trust_remote_code=True,
             use_safetensors=True,
         )
@@ -157,26 +163,25 @@ class VLMEngine:
         out_dir = os.path.join(self._tmp_root, uuid.uuid4().hex)
         os.makedirs(out_dir, exist_ok=True)
 
-        try:
-            self._model.infer(
-                self._tokenizer,
-                prompt=prompt,
-                image_file=image_file,
-                output_path=out_dir,
-                base_size=base_size,
-                image_size=image_size,
-                crop_mode=crop_mode,
-                save_results=True,
-            )
-            # Первичный источник — результат, записанный в файл (без служебных токенов).
-            mmd_path = os.path.join(out_dir, "result.mmd")
-            if os.path.exists(mmd_path):
-                with open(mmd_path, "r", encoding="utf-8") as f:
-                    text = f.read()
-            else:
-                # На некоторых промптах файл не создаётся — как запасной вариант
-                # вызываем без save_results и читаем возвращаемое значение.
-                text = (
+        def _run_infer(crop: bool) -> str:
+            """Запускает model.infer, возвращает сырой текст или ''."""
+            try:
+                self._model.infer(
+                    self._tokenizer,
+                    prompt=prompt,
+                    image_file=image_file,
+                    output_path=out_dir,
+                    base_size=base_size,
+                    image_size=image_size,
+                    crop_mode=crop,
+                    save_results=True,
+                )
+                mmd_path = os.path.join(out_dir, "result.mmd")
+                if os.path.exists(mmd_path):
+                    with open(mmd_path, "r", encoding="utf-8") as f:
+                        return f.read()
+                # result.mmd не создался — пробуем без save_results
+                return (
                     self._model.infer(
                         self._tokenizer,
                         prompt=prompt,
@@ -184,14 +189,29 @@ class VLMEngine:
                         output_path=out_dir,
                         base_size=base_size,
                         image_size=image_size,
-                        crop_mode=crop_mode,
+                        crop_mode=crop,
                         save_results=False,
                     )
                     or ""
                 )
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [VLM] infer failed: {exc}")
-            text = ""
+            except Exception as exc:  # noqa: BLE001
+                return f"__ERR__{exc}"
+
+        text = _run_infer(crop_mode)
+
+        # Баг DeepSeek-OCR-2: при crop_mode=True и маленьком изображении
+        # переменная param_img не инициализируется → UnboundLocalError.
+        # Retry с crop_mode=False всегда работает.
+        if text.startswith("__ERR__"):
+            err = text[7:]
+            if crop_mode:
+                text = _run_infer(False)
+                if text.startswith("__ERR__"):
+                    print(f"  [VLM] infer failed: {text[7:]}")
+                    text = ""
+            else:
+                print(f"  [VLM] infer failed: {err}")
+                text = ""
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
             if tmp_img_path:
@@ -234,3 +254,4 @@ class VLMEngine:
             if key in raw:
                 return key
         return "picture"
+    

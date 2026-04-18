@@ -3,8 +3,7 @@
 
 Треки:
 - VECTOR_TEXT  — PyMuPDF text dict по bbox
-- VECTOR_TABLE — Docling конвертит весь PDF один раз, таблицы сопоставляются
-                 с YOLO-блоками по IoU bbox
+- VECTOR_TABLE — PyMuPDF page.find_tables() c сопоставлением по IoU bbox
 - RASTER_*     — VLM (DeepSeek-OCR-2), вызывается из pipeline.py
 - SMART_FIGURE — VLM-классификация + маршрутизация
 """
@@ -130,55 +129,42 @@ def detect_heading_level(font_size: float, heading_sizes: list[float]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Таблицы: Docling кеш + сопоставление по IoU
+# Таблицы: PyMuPDF find_tables() + IoU-матчинг по bbox
 # ---------------------------------------------------------------------------
 
 
-class DoclingTableStore:
+class VectorTableStore:
     """
-    Однократная конвертация PDF через Docling. Таблицы индексируются по странице,
-    каждая ищется по IoU bbox.
+    Сканирует все страницы PDF через PyMuPDF `page.find_tables()` и кеширует
+    найденные таблицы по номеру страницы. Для YOLO-bbox возвращает наиболее
+    пересекающуюся таблицу (по IoU в PDF-points).
 
-    Docling bbox хранятся в PDF points. У нас coords YOLO-блока в пикселях 300 DPI —
-    конвертим в PDF points (×72/300) и считаем IoU.
+    Преимущества перед Docling:
+      - ноль внешних neural-зависимостей, работает на голом transformers==4.46.3;
+      - использует те же векторные линии и текстовые спаны, что и рендерит Acrobat;
+      - rowspan/colspan восстанавливаются через forward_fill в format_table_markdown.
     """
 
-    def __init__(self, pdf_path: str):
-        self._tables_by_page: dict[int, list[tuple[tuple, str]]] = {}
-        try:
-            from docling.document_converter import DocumentConverter
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError(
-                "Docling не установлен: `pip install docling docling-core`."
-            ) from exc
-
-        converter = DocumentConverter()
-        result = converter.convert(pdf_path)
-        doc = result.document
-
-        # Высоты страниц нужны, чтобы инвертировать BOTTOMLEFT → TOPLEFT.
-        page_heights = (
-            {
-                p.page_no: float(p.size.height)
-                for p in getattr(doc, "pages", {}).values()
-            }
-            if hasattr(doc, "pages")
-            else {}
-        )
-
-        for table in getattr(doc, "tables", []):
-            md = _finalize_table_markdown(table)
-            if not md:
+    def __init__(self, pdf_doc: fitz.Document):
+        self._tables_by_page: dict[int, list[tuple[tuple, list[list[str]]]]] = {}
+        for page_idx, page in enumerate(pdf_doc):
+            try:
+                finder = page.find_tables()
+            except Exception:
                 continue
-            for prov in getattr(table, "prov", []) or []:
-                page_no = int(getattr(prov, "page_no", 0))
-                bbox = getattr(prov, "bbox", None)
-                if bbox is None or page_no <= 0:
+            tables = getattr(finder, "tables", None) or list(finder or [])
+            for tbl in tables:
+                grid = _pymupdf_table_to_grid(tbl)
+                if not grid:
                     continue
-                tl = _bbox_to_topleft(bbox, page_heights.get(page_no))
-                if tl is None:
+                bbox = getattr(tbl, "bbox", None)
+                if bbox is None:
                     continue
-                self._tables_by_page.setdefault(page_no, []).append((tl, md))
+                # fitz.Rect → (l, t, r, b) в PDF points (top-left origin)
+                rect = fitz.Rect(bbox)
+                self._tables_by_page.setdefault(page_idx + 1, []).append(
+                    ((rect.x0, rect.y0, rect.x1, rect.y1), grid)
+                )
 
     def find(
         self, page_num_1based: int, coords_px: list, *, min_iou: float = 0.25
@@ -189,40 +175,15 @@ class DoclingTableStore:
             return None
 
         q = _to_pdf_rect(coords_px)
-        best_md, best_iou = None, 0.0
-        for bbox, md in candidates:
+        best_grid, best_iou = None, 0.0
+        for bbox, grid in candidates:
             iou = _iou(bbox, q)
             if iou > best_iou:
                 best_iou = iou
-                best_md = md
-        return best_md if best_iou >= min_iou else None
-
-
-def _bbox_to_topleft(bbox, page_height_pt: Optional[float]) -> Optional[tuple]:
-    """Приводит Docling bbox к (l, t, r, b) в TOPLEFT и в PDF points."""
-    try:
-        l = float(bbox.l)
-        r = float(bbox.r)
-        t = float(bbox.t)
-        b = float(bbox.b)
-    except AttributeError:
-        return None
-
-    origin = getattr(bbox, "coord_origin", None)
-    origin_name = getattr(origin, "name", str(origin) if origin else "")
-
-    if "BOTTOM" in origin_name.upper() and page_height_pt:
-        # y снизу вверх → инвертируем
-        new_t = page_height_pt - max(t, b)
-        new_b = page_height_pt - min(t, b)
-        t, b = new_t, new_b
-    else:
-        if t > b:
-            t, b = b, t
-
-    if l > r:
-        l, r = r, l
-    return (l, t, r, b)
+                best_grid = grid
+        if best_iou < min_iou or best_grid is None:
+            return None
+        return format_table_markdown(best_grid)
 
 
 def _iou(a: tuple, b: tuple) -> float:
@@ -237,54 +198,33 @@ def _iou(a: tuple, b: tuple) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _finalize_table_markdown(table_item) -> str:
+def _pymupdf_table_to_grid(tbl) -> Optional[list[list[str]]]:
     """
-    Docling умеет сам экспортировать таблицу в markdown. Поверх этого
-    добиваем требования хакатона:
-      1. Многоуровневые заголовки объединяются через `_`.
-      2. Объединённые ячейки дублируются (forward-fill).
+    PyMuPDF `Table.extract()` возвращает list[list[str|None]] с готовой
+    2D-структурой. Объединённые ячейки — None, forward_fill доделает
+    format_table_markdown.
     """
-    # Путь 1: есть структурированный grid — обрабатываем вручную.
-    grid = _table_to_grid(table_item)
-    if grid:
-        return format_table_markdown(grid)
-
-    # Путь 2: фолбэк — доклинговский экспорт (уже markdown).
     try:
-        md = table_item.export_to_markdown()
+        rows = tbl.extract()
     except Exception:
-        md = ""
-    return str(md).strip()
-
-
-def _table_to_grid(table_item) -> Optional[list[list[str]]]:
-    """Извлекает 2D-массив ячеек с учётом rowspan/colspan."""
-    data = getattr(table_item, "data", None)
-    if data is None:
         return None
-    nrows = int(getattr(data, "num_rows", 0) or 0)
-    ncols = int(getattr(data, "num_cols", 0) or 0)
-    if nrows == 0 or ncols == 0:
+    if not rows:
         return None
 
-    grid: list[list[str]] = [["" for _ in range(ncols)] for _ in range(nrows)]
-    cells = getattr(data, "table_cells", None) or getattr(data, "cells", None) or []
+    clean: list[list[str]] = []
+    for row in rows:
+        clean_row: list[str] = []
+        for cell in row:
+            if cell is None:
+                clean_row.append("")
+            else:
+                clean_row.append(str(cell).strip().replace("\n", " "))
+        clean.append(clean_row)
 
-    for cell in cells:
-        r0 = int(getattr(cell, "start_row_offset_idx", getattr(cell, "row_id", 0)) or 0)
-        c0 = int(getattr(cell, "start_col_offset_idx", getattr(cell, "col_id", 0)) or 0)
-        r1 = int(getattr(cell, "end_row_offset_idx", r0 + 1) or r0 + 1)
-        c1 = int(getattr(cell, "end_col_offset_idx", c0 + 1) or c0 + 1)
-        raw = getattr(cell, "text", "") or ""
-        text = str(raw).strip().replace("\n", " ")
-
-        # Дублируем содержимое объединённых ячеек (требование ТЗ)
-        for rr in range(r0, min(r1, nrows)):
-            for cc in range(c0, min(c1, ncols)):
-                if not grid[rr][cc]:
-                    grid[rr][cc] = text
-
-    return grid
+    # Отбрасываем полностью пустые таблицы — find_tables иногда ловит декор.
+    if not any(any(c for c in row) for row in clean):
+        return None
+    return clean
 
 
 # ---------------------------------------------------------------------------
@@ -308,8 +248,24 @@ def _forward_fill(table: list[list]) -> list[list[str]]:
     return result
 
 
-def format_table_markdown(table: list[list]) -> str:
-    """Markdown-таблица с многоуровневыми заголовками (header1_header2)."""
+_NUMERIC_RE = re.compile(r"^[\d\s.,+\-/%№()]+$")
+
+
+def _is_text_row(row: list[str]) -> bool:
+    """True если строка похожа на заголовок: все ячейки не числовые."""
+    non_empty = [c for c in row if c.strip()]
+    if not non_empty:
+        return False
+    return all(not _NUMERIC_RE.fullmatch(c) for c in non_empty)
+
+
+def format_table_markdown(table: list[list], n_header_rows: int = 0) -> str:
+    """
+    Markdown-таблица с многоуровневыми заголовками (header1_header2).
+
+    n_header_rows: если >0, явно задаёт количество строк-заголовков
+                   (передаётся из HTML-парсера по <th> тегам).
+    """
     if not table:
         return ""
 
@@ -317,12 +273,15 @@ def format_table_markdown(table: list[list]) -> str:
     if not filled or not filled[0]:
         return ""
 
-    header_rows = 1
-    if len(filled) >= 3:
-        r0, r1 = filled[0], filled[1]
-        non_numeric = all(not re.fullmatch(r"[\d\s.,+\-/%]+", c) or c == "" for c in r1)
-        repeats = sum(1 for c in r1 if c in r0 and c != "")
-        if non_numeric and repeats > max(1, len(r1) * 0.25):
+    if n_header_rows >= 2:
+        header_rows = 2
+    elif n_header_rows == 1:
+        header_rows = 1
+    else:
+        # Авто-определение: две верхних строки — оба заголовка,
+        # если обе полностью не числовые и минимум 3 строки данных.
+        header_rows = 1
+        if len(filled) >= 3 and _is_text_row(filled[0]) and _is_text_row(filled[1]):
             header_rows = 2
 
     if header_rows == 2:
