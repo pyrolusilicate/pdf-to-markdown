@@ -63,149 +63,162 @@ class LayoutRouter:
             return base_name.replace(".pdf", "")
 
     def _sort_reading_order(self, boxes: list, page_width: float, page_height: float) -> list:
-        """
-        Порядок чтения с устойчивой детекцией колонок.
-
-        Алгоритм:
-          1. Парсим боксы и отбрасываем шапки/подвалы.
-          2. Склеиваем пары (figure/table) + их caption в единый логический блок.
-          3. Определяем, является ли страница многоколоночной, кластеризуя
-             x-центры «узких» блоков (ширина < 55% страницы).
-          4. «Широкие» блоки (заголовки, full-width images) становятся
-             разделителями секций — между ними поток читается колоночно.
-          5. Внутри секции блоки назначаются в ближайшую колонку по x-центру,
-             каждая колонка читается сверху вниз.
-        """
         if not boxes:
             return []
 
-        parsed = []
+        parsed_boxes = []
         for box in boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            parsed.append(
+            coords = box.xyxy[0].tolist()
+            cls_name = self.model.names[int(box.cls[0])].lower()
+            parsed_boxes.append(
                 {
                     "box": box,
-                    "x1": x1,
-                    "y1": y1,
-                    "x2": x2,
-                    "y2": y2,
-                    "w": x2 - x1,
-                    "h": y2 - y1,
-                    "cx": (x1 + x2) / 2,
-                    "cls": self.model.names[int(box.cls[0])].lower(),
+                    "x1": coords[0],
+                    "y1": coords[1],
+                    "x2": coords[2],
+                    "y2": coords[3],
+                    "w": coords[2] - coords[0],
+                    "h": coords[3] - coords[1],
+                    "cls": cls_name
                 }
             )
 
-        # 1. Отфильтровать шапки/подвалы (ближе 5% к краю + типовая метка)
+        # 1. Фильтрация колонтитулов
         margin_top = page_height * 0.05
         margin_bottom = page_height * 0.95
-        filtered = []
-        for b in parsed:
-            if b["cls"] in ("page-header", "page-footer"):
+        filtered_boxes = []
+        for b in parsed_boxes:
+            if b["cls"] in ["page-header", "page-footer"]:
                 continue
-            if b["cls"] in ("text", "plain text", "title"):
+            if b["cls"] in ["text", "plain text", "title"]:
                 if b["y2"] < margin_top or b["y1"] > margin_bottom:
                     continue
-            filtered.append(b)
+            filtered_boxes.append(b)
 
-        if not filtered:
-            return []
+        # Первичная сортировка сверху вниз
+        filtered_boxes.sort(key=lambda x: x["y1"])
 
-        filtered.sort(key=lambda x: x["y1"])
+        # 2. ЛОГИЧЕСКАЯ ПРЕ-СКЛЕЙКА (Figure/Table + Caption)
+        # Связываем медиа-объекты с их подписями в единые неразрывные блоки
+        logical_blocks = []
+        used_indices = set()
 
-        # 2. Склейка media + caption в логические блоки.
-        caption_classes = {"figure_caption", "table_caption", "caption"}
-        media_classes = {"figure", "picture", "image", "table"}
-        logical = []
-        used = set()
-        for i, b in enumerate(filtered):
-            if i in used:
+        for i, b in enumerate(filtered_boxes):
+            if i in used_indices:
                 continue
-            group = [b]
-            used.add(i)
-            base = b
-            if base["cls"] in media_classes:
-                for j in range(i + 1, len(filtered)):
-                    if j in used:
-                        continue
-                    nxt = filtered[j]
-                    y_gap = nxt["y1"] - base["y2"]
-                    if y_gap > page_height * 0.05:
+                
+            current_logical = [b]
+            used_indices.add(i)
+            
+            base_box = b
+            for j in range(i + 1, len(filtered_boxes)):
+                if j in used_indices:
+                    continue
+                next_box = filtered_boxes[j]
+                
+                # Расстояние по вертикали
+                y_gap = next_box["y1"] - base_box["y2"]
+                
+                # Доля пересечения по X
+                overlap_x = max(0, min(base_box["x2"], next_box["x2"]) - max(base_box["x1"], next_box["x1"]))
+                min_w = min(base_box["w"], next_box["w"])
+                x_ratio = overlap_x / min_w if min_w > 0 else 0
+                
+                is_parent_media = base_box["cls"] in ["figure", "picture", "image", "table", "table_merged", "table_borderless"]
+                # Расширяем: клеим и caption, и обычный текст, если он явно работает как подпись
+                is_valid_child = next_box["cls"] in ["figure_caption", "table_caption", "caption", "text", "plain text"]
+                
+                # Если блок находится близко под картинкой/таблицей и сильно выровнен по ширине
+                if y_gap < page_height * 0.08 and x_ratio > 0.5:
+                    if is_parent_media and is_valid_child:
+                        current_logical.append(next_box)
+                        used_indices.add(j)
+                        base_box = next_box # Сдвигаем низ для возможной многострочной подписи
+                    else:
+                        break # Обычные абзацы не склеиваем жестко
+                elif y_gap >= page_height * 0.08:
+                    pass # Ушли слишком далеко вниз
+                    
+            # Формируем габариты объединенного логического блока
+            logical_blocks.append({
+                "boxes": current_logical,
+                "x1": min(cb["x1"] for cb in current_logical),
+                "y1": min(cb["y1"] for cb in current_logical),
+                "x2": max(cb["x2"] for cb in current_logical),
+                "y2": max(cb["y2"] for cb in current_logical),
+                "w": max(cb["x2"] for cb in current_logical) - min(cb["x1"] for cb in current_logical),
+                "h": max(cb["y2"] for cb in current_logical) - min(cb["y1"] for cb in current_logical),
+            })
+
+        # Вспомогательные функции для работы с блоками
+        def get_y_overlap_ratio(b1, b2):
+            overlap = max(0, min(b1["y2"], b2["y2"]) - max(b1["y1"], b2["y1"]))
+            min_h = min(b1["h"], b2["h"])
+            return overlap / min_h if min_h > 0 else 0
+
+        def get_x_overlap_ratio(b1, b2):
+            overlap = max(0, min(b1["x2"], b2["x2"]) - max(b1["x1"], b2["x1"]))
+            min_w = min(b1["w"], b2["w"])
+            return overlap / min_w if min_w > 0 else 0
+
+        # 3. Группируем логические блоки в горизонтальные полосы (Bands)
+        bands = []
+        current_band = []
+
+        for lb in logical_blocks:
+            is_full_width = lb["w"] > page_width * 0.55
+            
+            if is_full_width:
+                if current_band:
+                    bands.append(current_band)
+                    current_band = []
+                bands.append([lb])
+            else:
+                if not current_band:
+                    current_band.append(lb)
+                else:
+                    # Если есть горизонтальное пересечение — это одна "строка"
+                    if any(get_y_overlap_ratio(lb, cb) > 0.1 for cb in current_band):
+                        current_band.append(lb)
+                    else:
+                        bands.append(current_band)
+                        current_band = [lb]
+                        
+        if current_band:
+            bands.append(current_band)
+
+        # 4. Формируем колонки ВНУТРИ каждой полосы и распаковываем
+        final_sorted = []
+        for band in bands:
+            if len(band) <= 1:
+                for lb in band:
+                    for phys_box in lb["boxes"]:
+                        final_sorted.append(phys_box["box"])
+                continue
+                
+            columns = []
+            for lb in band:
+                placed = False
+                for col in columns:
+                    if any(get_x_overlap_ratio(lb, cb) > 0.1 for cb in col):
+                        col.append(lb)
+                        placed = True
                         break
-                    overlap_x = max(0, min(base["x2"], nxt["x2"]) - max(base["x1"], nxt["x1"]))
-                    min_w = min(base["w"], nxt["w"]) or 1
-                    if nxt["cls"] in caption_classes and overlap_x / min_w > 0.4:
-                        group.append(nxt)
-                        used.add(j)
-                        base = nxt
-                        break  # подпись одна — дальше не смотрим
-            logical.append(
-                {
-                    "boxes": group,
-                    "x1": min(b["x1"] for b in group),
-                    "y1": min(b["y1"] for b in group),
-                    "x2": max(b["x2"] for b in group),
-                    "y2": max(b["y2"] for b in group),
-                    "cx": sum((b["x1"] + b["x2"]) / 2 for b in group) / len(group),
-                }
-            )
-            logical[-1]["w"] = logical[-1]["x2"] - logical[-1]["x1"]
-            logical[-1]["h"] = logical[-1]["y2"] - logical[-1]["y1"]
+                
+                if not placed:
+                    columns.append([lb])
 
-        # 3. Кластеризация центров «узких» блоков → количество колонок.
-        narrow_centers = sorted(lb["cx"] for lb in logical if lb["w"] < page_width * 0.55)
-        col_centers = self._cluster_centers(narrow_centers, gap=page_width * 0.08)
+            # Сортируем локальные колонки слева направо
+            columns.sort(key=lambda col: min(cb["x1"] for cb in col))
+            
+            for col in columns:
+                col.sort(key=lambda x: x["y1"])
+                for lb in col:
+                    # Внутри блока уже отсортировано (Картинка -> Подпись)
+                    for phys_box in lb["boxes"]:
+                        final_sorted.append(phys_box["box"])
 
-        # Фильтруем слабые кластеры: минимум 2 блока, центры разнесены ≥ 15%
-        col_centers = [c for c in col_centers if c["count"] >= 2]
-        col_centers.sort(key=lambda c: c["center"])
-        if len(col_centers) >= 2:
-            dx = col_centers[-1]["center"] - col_centers[0]["center"]
-            if dx < page_width * 0.15:
-                col_centers = col_centers[:1]
-
-        is_multi_col = len(col_centers) >= 2
-        centers_x = [c["center"] for c in col_centers] if is_multi_col else None
-
-        # 4. Секции разделены «широкими» блоками (≥ 55% ширины).
-        sections: list[list[dict]] = []
-        current: list[dict] = []
-        for lb in logical:
-            if lb["w"] >= page_width * 0.55:
-                if current:
-                    sections.append(current)
-                    current = []
-                sections.append([lb])
-            else:
-                current.append(lb)
-        if current:
-            sections.append(current)
-
-        # 5. Сортировка внутри секций.
-        final: list = []
-        for sec in sections:
-            if len(sec) == 1 and sec[0]["w"] >= page_width * 0.55:
-                for phys in sec[0]["boxes"]:
-                    final.append(phys["box"])
-                continue
-
-            if is_multi_col:
-                cols: list[list[dict]] = [[] for _ in centers_x]
-                for lb in sec:
-                    dists = [abs(lb["cx"] - cx) for cx in centers_x]
-                    cols[dists.index(min(dists))].append(lb)
-                for col in cols:
-                    col.sort(key=lambda x: x["y1"])
-                    for lb in col:
-                        for phys in lb["boxes"]:
-                            final.append(phys["box"])
-            else:
-                sec.sort(key=lambda x: x["y1"])
-                for lb in sec:
-                    for phys in lb["boxes"]:
-                        final.append(phys["box"])
-
-        return final
+        return final_sorted
 
     @staticmethod
     def _cluster_centers(centers: list[float], gap: float) -> list[dict]:
