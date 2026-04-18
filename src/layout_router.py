@@ -315,7 +315,7 @@ class LayoutRouter:
         print(f"\nАнализ: {os.path.basename(pdf_path)} (ID: {doc_id})")
 
         for page_num, page in enumerate(doc):
-            pix = page.get_pixmap(dpi=400)
+            pix = page.get_pixmap(dpi=300)
             img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
                 pix.height, pix.width, pix.n
             )
@@ -329,29 +329,84 @@ class LayoutRouter:
             pil_img = Image.fromarray(img_rgb)
 
             # --- ВНЕДРЕНИЕ ОЧИСТКИ ОТ ШУМА ---
-            # 1. Медианный фильтр (идеально для перцового шума, ядро 3x3)
             img_cv2_denoised = cv2.medianBlur(img_cv2, 3)
-            
-            # (Опционально) 2. Если страницы выглядят как плохие сканы с серым фоном,
-            # можно добавить адаптивную бинаризацию для повышения контраста перед YOLO:
-            # gray = cv2.cvtColor(img_cv2_denoised, cv2.COLOR_BGR2GRAY)
-            # thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-            # img_cv2_denoised = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-            # ---------------------------------
 
-            # Обрати внимание: предикт делаем на очищенном img_cv2_denoised!
-            results = self.model.predict(
-                img_cv2_denoised, imgsz=1488, conf=0.165, device=self.device, verbose=False
+            # =====================================================================
+            # --- ВНЕДРЕНИЕ: MULTI-SCALE INFERENCE (ДВУХПРОХОДНЫЙ АНСАМБЛЬ) ---
+            # =====================================================================
+            
+            def get_ioa(box_small, box_large):
+                """Вычисляет, какой процент площади box_small находится внутри box_large"""
+                x_left = max(box_small[0], box_large[0])
+                y_top = max(box_small[1], box_large[1])
+                x_right = min(box_small[2], box_large[2])
+                y_bottom = min(box_small[3], box_large[3])
+
+                if x_right < x_left or y_bottom < y_top:
+                    return 0.0
+
+                inter_area = (x_right - x_left) * (y_bottom - y_top)
+                small_area = (box_small[2] - box_small[0]) * (box_small[3] - box_small[1])
+                return inter_area / small_area if small_area > 0 else 0
+
+            # 1. Глобальный проход (надежные границы, широкие таблицы не режутся)
+            res_1280 = self.model.predict(
+                img_cv2_denoised, imgsz=1280, conf=0.165, device=self.device, verbose=False
             )[0]
 
+            # 2. Детальный проход (лупа для поиска разделений между таблицами)
+            res_2400 = self.model.predict(
+                img_cv2_denoised, imgsz=2400, conf=0.165, device=self.device, verbose=False
+            )[0]
+
+            final_boxes = []
+            
+            # Парсим боксы из 2400 для быстрого поиска
+            boxes_2400_parsed = []
+            for b in res_2400.boxes:
+                boxes_2400_parsed.append({
+                    "coords": b.xyxy[0].tolist(),
+                    "cls": self.model.names[int(b.cls[0])].lower(),
+                    "box_obj": b
+                })
+
+            # Проходимся по глобальным якорям (1280)
+            for b_1280 in res_1280.boxes:
+                coords_1280 = b_1280.xyxy[0].tolist()
+                cls_1280 = self.model.names[int(b_1280.cls[0])].lower()
+                
+                # Применяем логику разделения только к таблицам
+                if cls_1280 in ["table", "table_merged", "table_borderless"]:
+                    # Ищем все боксы из прохода 2400, которые на 80%+ лежат внутри этой большой таблицы
+                    internal_boxes = [
+                        b2400 for b2400 in boxes_2400_parsed 
+                        if b2400["cls"] == cls_1280 and get_ioa(b2400["coords"], coords_1280) > 0.8
+                    ]
+                    
+                    # Если лупа нашла 2 или более таблиц внутри одной глобальной — берем их!
+                    if len(internal_boxes) >= 2:
+                        for internal in internal_boxes:
+                            final_boxes.append(internal["box_obj"])
+                            boxes_2400_parsed.remove(internal) # Удаляем, чтобы не продублировать
+                    else:
+                        final_boxes.append(b_1280)
+                else:
+                    # Для текста, заголовков и картинок полностью доверяем 1280
+                    final_boxes.append(b_1280)
+            
+            # =====================================================================
+
             if visualize and vis_dir:
-                annotated_frame = results.plot(pil=True, line_width=2, font_size=12)
+                # Визуализируем сырой глобальный проход (для отладки)
+                annotated_frame = res_1280.plot(pil=True, line_width=2, font_size=12)
                 cv2.imwrite(
                     os.path.join(vis_dir, f"page_{page_num + 1}.jpg"), annotated_frame
                 )
 
-            filtered_boxes = self._apply_nms(list(results.boxes))
+            # Передаем ансамбль боксов в NMS и далее в сортировщик!
+            filtered_boxes = self._apply_nms(final_boxes)
             sorted_boxes = self._sort_reading_order(filtered_boxes, pil_img.width, pil_img.height)
+            
             page_plan = {
                 "page_num": page_num + 1,
                 "width_px": pil_img.width,
@@ -511,7 +566,6 @@ class LayoutRouter:
 
         doc.close()
         return routing_plan
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LayoutRouter")
