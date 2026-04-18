@@ -8,7 +8,6 @@ dependencies = [
     # Layout (YOLO)
     "doclayout-yolo>=0.0.4",
     "ultralytics>=8.4.38",
-
     # DeepSeek-OCR-2 — жёсткий стек (требуется custom modeling через trust_remote_code).
     # Более новые transformers/tokenizers ломают импорт LlamaFlashAttention2.
     "torch==2.6.0",
@@ -21,15 +20,14 @@ dependencies = [
     "easydict",
     # flash-attn ставится ОТДЕЛЬНО (только на CUDA):
     #   pip install flash-attn==2.7.3 --no-build-isolation
-
     # PDF и изображения (таблицы — PyMuPDF find_tables, без Docling)
     "pymupdf>=1.24.0",
     "pillow>=10.0.0",
     "opencv-python>=4.9.0",
     "numpy>=1.26.0",
-
     # HuggingFace Hub
     "huggingface-hub>=0.24.0",
+    "dill>=0.4.1",
 ]
 
 # ---------------------------------------------------------------------------
