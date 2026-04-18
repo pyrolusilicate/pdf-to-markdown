@@ -192,18 +192,20 @@ class LayoutRouter:
         for lb in logical_blocks:
             lb_span = (lb["x1"], lb["x2"])
             lb_width = lb["w"]
-            
+
             # --- ПРОВЕРКА НА РАЗДЕЛИТЕЛЬ ---
-            # Если блок шире 55% страницы (например, заголовок над таблицами) 
+            # Если блок шире 55% страницы (например, заголовок над таблицами)
             # ИЛИ это явно заголовок (title) по классификации YOLO
             is_full_width = lb_width > page_width * 0.55
-            is_title_class = any(b["cls"] in ["title", "section-header"] for b in lb["boxes"])
-            
+            is_title_class = any(
+                b["cls"] in ["title", "section-header"] for b in lb["boxes"]
+            )
+
             if is_full_width or is_title_class:
                 if current_columns:
                     bands.append(current_columns)
                 # Широкий блок идет отдельной изолированной полосой из 1 колонки
-                bands.append([[lb]]) 
+                bands.append([[lb]])
                 current_columns = []
                 continue
             # -------------------------------
@@ -212,10 +214,12 @@ class LayoutRouter:
             for i, col in enumerate(current_columns):
                 col_span = get_col_x_range(col)
                 col_width = col_span[1] - col_span[0]
-                
+
                 # Считаем длину физического пересечения по оси X
-                overlap = max(0, min(lb_span[1], col_span[1]) - max(lb_span[0], col_span[0]))
-                
+                overlap = max(
+                    0, min(lb_span[1], col_span[1]) - max(lb_span[0], col_span[0])
+                )
+
                 # Если пересечение больше 40% от ширины более узкого элемента — они в одной колонке
                 min_w = min(lb_width, col_width)
                 if min_w > 0 and (overlap / min_w) > 0.4:
@@ -225,7 +229,7 @@ class LayoutRouter:
             if len(overlapped_cols) > 1:
                 if current_columns:
                     bands.append(current_columns)
-                current_columns = [[lb]]  
+                current_columns = [[lb]]
             elif len(overlapped_cols) == 1:
                 # Блок принадлежит одной конкретной колонке
                 col_idx = overlapped_cols[0]
@@ -242,11 +246,11 @@ class LayoutRouter:
         for cols in bands:
             # Сортируем колонки слева направо
             cols.sort(key=lambda col: min(cb["x1"] for cb in col))
-            
+
             for col in cols:
                 # Внутри колонки строго сортируем блоки сверху вниз
                 col.sort(key=lambda b: b["y1"])
-                
+
                 for lb in col:
                     # Внутри логического блока картинки и подписи уже отсортированы на Шаге 2
                     for phys_box in lb["boxes"]:
@@ -363,7 +367,7 @@ class LayoutRouter:
             # =====================================================================
             # --- ВНЕДРЕНИЕ: MULTI-SCALE INFERENCE (ДВУХПРОХОДНЫЙ АНСАМБЛЬ) ---
             # =====================================================================
-            
+
             def get_ioa(box_small, box_large):
                 """Вычисляет, какой процент площади box_small находится внутри box_large"""
                 x_left = max(box_small[0], box_large[0])
@@ -375,54 +379,70 @@ class LayoutRouter:
                     return 0.0
 
                 inter_area = (x_right - x_left) * (y_bottom - y_top)
-                small_area = (box_small[2] - box_small[0]) * (box_small[3] - box_small[1])
+                small_area = (box_small[2] - box_small[0]) * (
+                    box_small[3] - box_small[1]
+                )
                 return inter_area / small_area if small_area > 0 else 0
 
             # 1. Глобальный проход (надежные границы, широкие таблицы не режутся)
             res_1280 = self.model.predict(
-                img_cv2_denoised, imgsz=1280, conf=0.165, device=self.device, verbose=False
+                img_cv2_denoised,
+                imgsz=1280,
+                conf=0.165,
+                device=self.device,
+                verbose=False,
             )[0]
 
             # 2. Детальный проход (лупа для поиска разделений между таблицами)
             res_2400 = self.model.predict(
-                img_cv2_denoised, imgsz=2400, conf=0.165, device=self.device, verbose=False
+                img_cv2_denoised,
+                imgsz=2400,
+                conf=0.165,
+                device=self.device,
+                verbose=False,
             )[0]
 
             final_boxes = []
-            
+
             # Парсим боксы из 2400 для быстрого поиска
             boxes_2400_parsed = []
             for b in res_2400.boxes:
-                boxes_2400_parsed.append({
-                    "coords": b.xyxy[0].tolist(),
-                    "cls": self.model.names[int(b.cls[0])].lower(),
-                    "box_obj": b
-                })
+                boxes_2400_parsed.append(
+                    {
+                        "coords": b.xyxy[0].tolist(),
+                        "cls": self.model.names[int(b.cls[0])].lower(),
+                        "box_obj": b,
+                    }
+                )
 
             # Проходимся по глобальным якорям (1280)
             for b_1280 in res_1280.boxes:
                 coords_1280 = b_1280.xyxy[0].tolist()
                 cls_1280 = self.model.names[int(b_1280.cls[0])].lower()
-                
+
                 # Применяем логику разделения только к таблицам
                 if cls_1280 in ["table", "table_merged", "table_borderless"]:
                     # Ищем все боксы из прохода 2400, которые на 80%+ лежат внутри этой большой таблицы
                     internal_boxes = [
-                        b2400 for b2400 in boxes_2400_parsed 
-                        if b2400["cls"] == cls_1280 and get_ioa(b2400["coords"], coords_1280) > 0.8
+                        b2400
+                        for b2400 in boxes_2400_parsed
+                        if b2400["cls"] == cls_1280
+                        and get_ioa(b2400["coords"], coords_1280) > 0.8
                     ]
-                    
+
                     # Если лупа нашла 2 или более таблиц внутри одной глобальной — берем их!
                     if len(internal_boxes) >= 2:
                         for internal in internal_boxes:
                             final_boxes.append(internal["box_obj"])
-                            boxes_2400_parsed.remove(internal) # Удаляем, чтобы не продублировать
+                            boxes_2400_parsed.remove(
+                                internal
+                            )  # Удаляем, чтобы не продублировать
                     else:
                         final_boxes.append(b_1280)
                 else:
                     # Для текста, заголовков и картинок полностью доверяем 1280
                     final_boxes.append(b_1280)
-            
+
             # =====================================================================
 
             if visualize and vis_dir:
@@ -434,8 +454,10 @@ class LayoutRouter:
 
             # Передаем ансамбль боксов в NMS и далее в сортировщик!
             filtered_boxes = self._apply_nms(final_boxes)
-            sorted_boxes = self._sort_reading_order(filtered_boxes, pil_img.width, pil_img.height)
-            
+            sorted_boxes = self._sort_reading_order(
+                filtered_boxes, pil_img.width, pil_img.height
+            )
+
             page_plan = {
                 "page_num": page_num + 1,
                 "width_px": pil_img.width,
@@ -603,6 +625,7 @@ class LayoutRouter:
 
         doc.close()
         return routing_plan
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LayoutRouter")
