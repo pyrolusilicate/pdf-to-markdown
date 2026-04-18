@@ -5,13 +5,12 @@ import os
 import cv2
 import fitz
 import numpy as np
+import torch
 from doclayout_yolo import YOLOv10
 from huggingface_hub import hf_hub_download
 from PIL import Image
 
 from device import get_torch_device, setup_environment
-
-import torch
 
 _original_load = torch.load
 torch.load = lambda *args, **kwargs: _original_load(
@@ -21,6 +20,7 @@ torch.load = lambda *args, **kwargs: _original_load(
 setup_environment()
 
 weights_name_file = "doclayout_yolo_docstructbench_imgsz1280_2501.pt"
+
 
 class LayoutRouter:
     def __init__(self, weights_dir: str = "weights"):
@@ -52,9 +52,7 @@ class LayoutRouter:
 
     def _load_model(self) -> YOLOv10:
         os.makedirs(self.weights_dir, exist_ok=True)
-        weights_path = os.path.join(
-            self.weights_dir, weights_name_file
-        )
+        weights_path = os.path.join(self.weights_dir, weights_name_file)
         if not os.path.exists(weights_path):
             hf_hub_download(
                 repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
@@ -70,7 +68,9 @@ class LayoutRouter:
         except ValueError:
             return base_name.replace(".pdf", "")
 
-    def _sort_reading_order(self, boxes: list, page_width: float, page_height: float) -> list:
+    def _sort_reading_order(
+        self, boxes: list, page_width: float, page_height: float
+    ) -> list:
         if not boxes:
             return []
 
@@ -87,7 +87,7 @@ class LayoutRouter:
                     "y2": coords[3],
                     "w": coords[2] - coords[0],
                     "h": coords[3] - coords[1],
-                    "cls": cls_name
+                    "cls": cls_name,
                 }
             )
 
@@ -114,49 +114,72 @@ class LayoutRouter:
         for i, b in enumerate(filtered_boxes):
             if i in used_indices:
                 continue
-                
+
             current_logical = [b]
             used_indices.add(i)
-            
+
             base_box = b
             for j in range(i + 1, len(filtered_boxes)):
                 if j in used_indices:
                     continue
                 next_box = filtered_boxes[j]
-                
+
                 # Расстояние по вертикали
                 y_gap = next_box["y1"] - base_box["y2"]
-                
+
                 # Доля пересечения по X
-                overlap_x = max(0, min(base_box["x2"], next_box["x2"]) - max(base_box["x1"], next_box["x1"]))
+                overlap_x = max(
+                    0,
+                    min(base_box["x2"], next_box["x2"])
+                    - max(base_box["x1"], next_box["x1"]),
+                )
                 min_w = min(base_box["w"], next_box["w"])
                 x_ratio = overlap_x / min_w if min_w > 0 else 0
-                
-                is_parent_media = base_box["cls"] in ["figure", "picture", "image", "table", "table_merged", "table_borderless"]
+
+                is_parent_media = base_box["cls"] in [
+                    "figure",
+                    "picture",
+                    "image",
+                    "table",
+                    "table_merged",
+                    "table_borderless",
+                ]
                 # Расширяем: клеим и caption, и обычный текст, если он явно работает как подпись
-                is_valid_child = next_box["cls"] in ["figure_caption", "table_caption", "caption", "text", "plain text"]
-                
+                is_valid_child = next_box["cls"] in [
+                    "figure_caption",
+                    "table_caption",
+                    "caption",
+                    "text",
+                    "plain text",
+                ]
+
                 # Если блок находится близко под картинкой/таблицей и сильно выровнен по ширине
                 if y_gap < page_height * 0.08 and x_ratio > 0.5:
                     if is_parent_media and is_valid_child:
                         current_logical.append(next_box)
                         used_indices.add(j)
-                        base_box = next_box # Сдвигаем низ для возможной многострочной подписи
+                        base_box = (
+                            next_box  # Сдвигаем низ для возможной многострочной подписи
+                        )
                     else:
-                        break # Обычные абзацы не склеиваем жестко
+                        break  # Обычные абзацы не склеиваем жестко
                 elif y_gap >= page_height * 0.08:
-                    pass # Ушли слишком далеко вниз
-                    
+                    pass  # Ушли слишком далеко вниз
+
             # Формируем габариты объединенного логического блока
-            logical_blocks.append({
-                "boxes": current_logical,
-                "x1": min(cb["x1"] for cb in current_logical),
-                "y1": min(cb["y1"] for cb in current_logical),
-                "x2": max(cb["x2"] for cb in current_logical),
-                "y2": max(cb["y2"] for cb in current_logical),
-                "w": max(cb["x2"] for cb in current_logical) - min(cb["x1"] for cb in current_logical),
-                "h": max(cb["y2"] for cb in current_logical) - min(cb["y1"] for cb in current_logical),
-            })
+            logical_blocks.append(
+                {
+                    "boxes": current_logical,
+                    "x1": min(cb["x1"] for cb in current_logical),
+                    "y1": min(cb["y1"] for cb in current_logical),
+                    "x2": max(cb["x2"] for cb in current_logical),
+                    "y2": max(cb["y2"] for cb in current_logical),
+                    "w": max(cb["x2"] for cb in current_logical)
+                    - min(cb["x1"] for cb in current_logical),
+                    "h": max(cb["y2"] for cb in current_logical)
+                    - min(cb["y1"] for cb in current_logical),
+                }
+            )
 
         # 3. Динамическое формирование колонок и полос (Bands)
         bands = []
@@ -169,18 +192,20 @@ class LayoutRouter:
         for lb in logical_blocks:
             lb_span = (lb["x1"], lb["x2"])
             lb_width = lb["w"]
-            
+
             # --- ПРОВЕРКА НА РАЗДЕЛИТЕЛЬ ---
-            # Если блок шире 55% страницы (например, заголовок над таблицами) 
+            # Если блок шире 55% страницы (например, заголовок над таблицами)
             # ИЛИ это явно заголовок (title) по классификации YOLO
             is_full_width = lb_width > page_width * 0.55
-            is_title_class = any(b["cls"] in ["title", "section-header"] for b in lb["boxes"])
-            
+            is_title_class = any(
+                b["cls"] in ["title", "section-header"] for b in lb["boxes"]
+            )
+
             if is_full_width or is_title_class:
                 if current_columns:
                     bands.append(current_columns)
                 # Широкий блок идет отдельной изолированной полосой из 1 колонки
-                bands.append([[lb]]) 
+                bands.append([[lb]])
                 current_columns = []
                 continue
             # -------------------------------
@@ -189,10 +214,12 @@ class LayoutRouter:
             for i, col in enumerate(current_columns):
                 col_span = get_col_x_range(col)
                 col_width = col_span[1] - col_span[0]
-                
+
                 # Считаем длину физического пересечения по оси X
-                overlap = max(0, min(lb_span[1], col_span[1]) - max(lb_span[0], col_span[0]))
-                
+                overlap = max(
+                    0, min(lb_span[1], col_span[1]) - max(lb_span[0], col_span[0])
+                )
+
                 # Если пересечение больше 40% от ширины более узкого элемента — они в одной колонке
                 min_w = min(lb_width, col_width)
                 if min_w > 0 and (overlap / min_w) > 0.4:
@@ -202,7 +229,7 @@ class LayoutRouter:
             if len(overlapped_cols) > 1:
                 if current_columns:
                     bands.append(current_columns)
-                current_columns = [[lb]]  
+                current_columns = [[lb]]
             elif len(overlapped_cols) == 1:
                 # Блок принадлежит одной конкретной колонке
                 col_idx = overlapped_cols[0]
@@ -219,11 +246,11 @@ class LayoutRouter:
         for cols in bands:
             # Сортируем колонки слева направо
             cols.sort(key=lambda col: min(cb["x1"] for cb in col))
-            
+
             for col in cols:
                 # Внутри колонки строго сортируем блоки сверху вниз
                 col.sort(key=lambda b: b["y1"])
-                
+
                 for lb in col:
                     # Внутри логического блока картинки и подписи уже отсортированы на Шаге 2
                     for phys_box in lb["boxes"]:
@@ -311,7 +338,11 @@ class LayoutRouter:
             os.makedirs(vis_dir, exist_ok=True)
 
         doc = fitz.open(pdf_path)
-        routing_plan = {"doc_id": doc_id, "pdf_path": os.path.abspath(pdf_path), "pages": []}
+        routing_plan = {
+            "doc_id": doc_id,
+            "pdf_path": os.path.abspath(pdf_path),
+            "pages": [],
+        }
         global_image_counter = 1
 
         print(f"\nАнализ: {os.path.basename(pdf_path)} (ID: {doc_id})")
@@ -336,7 +367,7 @@ class LayoutRouter:
             # =====================================================================
             # --- ВНЕДРЕНИЕ: MULTI-SCALE INFERENCE (ДВУХПРОХОДНЫЙ АНСАМБЛЬ) ---
             # =====================================================================
-            
+
             def get_ioa(box_small, box_large):
                 """Вычисляет, какой процент площади box_small находится внутри box_large"""
                 x_left = max(box_small[0], box_large[0])
@@ -348,54 +379,70 @@ class LayoutRouter:
                     return 0.0
 
                 inter_area = (x_right - x_left) * (y_bottom - y_top)
-                small_area = (box_small[2] - box_small[0]) * (box_small[3] - box_small[1])
+                small_area = (box_small[2] - box_small[0]) * (
+                    box_small[3] - box_small[1]
+                )
                 return inter_area / small_area if small_area > 0 else 0
 
             # 1. Глобальный проход (надежные границы, широкие таблицы не режутся)
             res_1280 = self.model.predict(
-                img_cv2_denoised, imgsz=1280, conf=0.165, device=self.device, verbose=False
+                img_cv2_denoised,
+                imgsz=1280,
+                conf=0.165,
+                device=self.device,
+                verbose=False,
             )[0]
 
             # 2. Детальный проход (лупа для поиска разделений между таблицами)
             res_2400 = self.model.predict(
-                img_cv2_denoised, imgsz=2400, conf=0.165, device=self.device, verbose=False
+                img_cv2_denoised,
+                imgsz=2400,
+                conf=0.165,
+                device=self.device,
+                verbose=False,
             )[0]
 
             final_boxes = []
-            
+
             # Парсим боксы из 2400 для быстрого поиска
             boxes_2400_parsed = []
             for b in res_2400.boxes:
-                boxes_2400_parsed.append({
-                    "coords": b.xyxy[0].tolist(),
-                    "cls": self.model.names[int(b.cls[0])].lower(),
-                    "box_obj": b
-                })
+                boxes_2400_parsed.append(
+                    {
+                        "coords": b.xyxy[0].tolist(),
+                        "cls": self.model.names[int(b.cls[0])].lower(),
+                        "box_obj": b,
+                    }
+                )
 
             # Проходимся по глобальным якорям (1280)
             for b_1280 in res_1280.boxes:
                 coords_1280 = b_1280.xyxy[0].tolist()
                 cls_1280 = self.model.names[int(b_1280.cls[0])].lower()
-                
+
                 # Применяем логику разделения только к таблицам
                 if cls_1280 in ["table", "table_merged", "table_borderless"]:
                     # Ищем все боксы из прохода 2400, которые на 80%+ лежат внутри этой большой таблицы
                     internal_boxes = [
-                        b2400 for b2400 in boxes_2400_parsed 
-                        if b2400["cls"] == cls_1280 and get_ioa(b2400["coords"], coords_1280) > 0.8
+                        b2400
+                        for b2400 in boxes_2400_parsed
+                        if b2400["cls"] == cls_1280
+                        and get_ioa(b2400["coords"], coords_1280) > 0.8
                     ]
-                    
+
                     # Если лупа нашла 2 или более таблиц внутри одной глобальной — берем их!
                     if len(internal_boxes) >= 2:
                         for internal in internal_boxes:
                             final_boxes.append(internal["box_obj"])
-                            boxes_2400_parsed.remove(internal) # Удаляем, чтобы не продублировать
+                            boxes_2400_parsed.remove(
+                                internal
+                            )  # Удаляем, чтобы не продублировать
                     else:
                         final_boxes.append(b_1280)
                 else:
                     # Для текста, заголовков и картинок полностью доверяем 1280
                     final_boxes.append(b_1280)
-            
+
             # =====================================================================
 
             if visualize and vis_dir:
@@ -407,8 +454,10 @@ class LayoutRouter:
 
             # Передаем ансамбль боксов в NMS и далее в сортировщик!
             filtered_boxes = self._apply_nms(final_boxes)
-            sorted_boxes = self._sort_reading_order(filtered_boxes, pil_img.width, pil_img.height)
-            
+            sorted_boxes = self._sort_reading_order(
+                filtered_boxes, pil_img.width, pil_img.height
+            )
+
             page_plan = {
                 "page_num": page_num + 1,
                 "width_px": pil_img.width,
@@ -530,44 +579,53 @@ class LayoutRouter:
                     page_plan["blocks"].append(block)
 
             routing_plan["pages"].append(page_plan)
-        
+
             if visualize and vis_dir:
                 # Рисуем поверх оригинальной картинки
                 img_draw = img_cv2.copy()
-                
+
                 # Отдельный счетчик для валидных (не игнорируемых) блоков
-                valid_block_counter = 1 
-                
+                valid_block_counter = 1
+
                 for box in sorted_boxes:
                     label = self.model.names[int(box.cls[0])].lower()
-                    
+
                     # Пропускаем abandon и все остальные классы из ignore_classes
                     if label in self.ignore_classes:
                         continue
 
                     coords = [int(c) for c in box.xyxy[0].tolist()]
-                    
+
                     # Отрисовываем рамку (зеленая)
-                    cv2.rectangle(img_draw, (coords[0], coords[1]), (coords[2], coords[3]), (0, 255, 0), 2)
-                    
+                    cv2.rectangle(
+                        img_draw,
+                        (coords[0], coords[1]),
+                        (coords[2], coords[3]),
+                        (0, 255, 0),
+                        2,
+                    )
+
                     # Рисуем порядковый номер и класс блока (например: "1 (text)")
                     order_text = f"{valid_block_counter} ({label})"
                     cv2.putText(
-                        img_draw, 
-                        order_text, 
-                        (coords[0] + 5, coords[1] + 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.8, # Немного уменьшили шрифт, чтобы влезло название класса
-                        (0, 0, 255), # Красный цвет (BGR)
-                        2 # Толщина линии
+                        img_draw,
+                        order_text,
+                        (coords[0] + 5, coords[1] + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,  # Немного уменьшили шрифт, чтобы влезло название класса
+                        (0, 0, 255),  # Красный цвет (BGR)
+                        2,  # Толщина линии
                     )
-                    
+
                     valid_block_counter += 1
-                
-                cv2.imwrite(os.path.join(vis_dir, f"page_{page_num + 1}_order.jpg"), img_draw)
+
+                cv2.imwrite(
+                    os.path.join(vis_dir, f"page_{page_num + 1}_order.jpg"), img_draw
+                )
 
         doc.close()
         return routing_plan
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LayoutRouter")
