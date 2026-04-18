@@ -156,71 +156,74 @@ class LayoutRouter:
                 "h": max(cb["y2"] for cb in current_logical) - min(cb["y1"] for cb in current_logical),
             })
 
-        # Вспомогательные функции для работы с блоками
-        def get_y_overlap_ratio(b1, b2):
-            overlap = max(0, min(b1["y2"], b2["y2"]) - max(b1["y1"], b2["y1"]))
-            min_h = min(b1["h"], b2["h"])
-            return overlap / min_h if min_h > 0 else 0
-
-        def get_x_overlap_ratio(b1, b2):
-            overlap = max(0, min(b1["x2"], b2["x2"]) - max(b1["x1"], b2["x1"]))
-            min_w = min(b1["w"], b2["w"])
-            return overlap / min_w if min_w > 0 else 0
-
-        # 3. Группируем логические блоки в горизонтальные полосы (Bands)
+        # 3. Динамическое формирование колонок и полос (Bands)
         bands = []
-        current_band = []
+        current_columns = []
+
+        def get_col_x_range(col):
+            # Границы колонки определяются по её крайним элементам
+            return min(cb["x1"] for cb in col), max(cb["x2"] for cb in col)
 
         for lb in logical_blocks:
-            is_full_width = lb["w"] > page_width * 0.55
+            lb_span = (lb["x1"], lb["x2"])
+            lb_width = lb["w"]
             
-            if is_full_width:
-                if current_band:
-                    bands.append(current_band)
-                    current_band = []
-                bands.append([lb])
-            else:
-                if not current_band:
-                    current_band.append(lb)
-                else:
-                    # Если есть горизонтальное пересечение — это одна "строка"
-                    if any(get_y_overlap_ratio(lb, cb) > 0.1 for cb in current_band):
-                        current_band.append(lb)
-                    else:
-                        bands.append(current_band)
-                        current_band = [lb]
-                        
-        if current_band:
-            bands.append(current_band)
-
-        # 4. Формируем колонки ВНУТРИ каждой полосы и распаковываем
-        final_sorted = []
-        for band in bands:
-            if len(band) <= 1:
-                for lb in band:
-                    for phys_box in lb["boxes"]:
-                        final_sorted.append(phys_box["box"])
+            # --- ПРОВЕРКА НА РАЗДЕЛИТЕЛЬ ---
+            # Если блок шире 55% страницы (например, заголовок над таблицами) 
+            # ИЛИ это явно заголовок (title) по классификации YOLO
+            is_full_width = lb_width > page_width * 0.55
+            is_title_class = any(b["cls"] in ["title", "section-header"] for b in lb["boxes"])
+            
+            if is_full_width or is_title_class:
+                if current_columns:
+                    bands.append(current_columns)
+                # Широкий блок идет отдельной изолированной полосой из 1 колонки
+                bands.append([[lb]]) 
+                current_columns = []
                 continue
-                
-            columns = []
-            for lb in band:
-                placed = False
-                for col in columns:
-                    if any(get_x_overlap_ratio(lb, cb) > 0.1 for cb in col):
-                        col.append(lb)
-                        placed = True
-                        break
-                
-                if not placed:
-                    columns.append([lb])
+            # -------------------------------
 
-            # Сортируем локальные колонки слева направо
-            columns.sort(key=lambda col: min(cb["x1"] for cb in col))
+            overlapped_cols = []
+            for i, col in enumerate(current_columns):
+                col_span = get_col_x_range(col)
+                col_width = col_span[1] - col_span[0]
+                
+                # Считаем длину физического пересечения по оси X
+                overlap = max(0, min(lb_span[1], col_span[1]) - max(lb_span[0], col_span[0]))
+                
+                # Если пересечение больше 40% от ширины более узкого элемента — они в одной колонке
+                min_w = min(lb_width, col_width)
+                if min_w > 0 and (overlap / min_w) > 0.4:
+                    overlapped_cols.append(i)
+
+            # Если блок пересекает НЕСКОЛЬКО узких колонок
+            if len(overlapped_cols) > 1:
+                if current_columns:
+                    bands.append(current_columns)
+                current_columns = [[lb]]  
+            elif len(overlapped_cols) == 1:
+                # Блок принадлежит одной конкретной колонке
+                col_idx = overlapped_cols[0]
+                current_columns[col_idx].append(lb)
+            else:
+                # Блок не пересекается с текущими колонками — создаем новую колонку
+                current_columns.append([lb])
+
+        if current_columns:
+            bands.append(current_columns)
+
+        # 4. Распаковка: Bands -> Columns -> Blocks
+        final_sorted = []
+        for cols in bands:
+            # Сортируем колонки слева направо
+            cols.sort(key=lambda col: min(cb["x1"] for cb in col))
             
-            for col in columns:
-                col.sort(key=lambda x: x["y1"])
+            for col in cols:
+                # Внутри колонки строго сортируем блоки сверху вниз
+                col.sort(key=lambda b: b["y1"])
+                
                 for lb in col:
-                    # Внутри блока уже отсортировано (Картинка -> Подпись)
+                    # Внутри логического блока картинки и подписи уже отсортированы на Шаге 2
                     for phys_box in lb["boxes"]:
                         final_sorted.append(phys_box["box"])
 
@@ -338,7 +341,7 @@ class LayoutRouter:
 
             # Обрати внимание: предикт делаем на очищенном img_cv2_denoised!
             results = self.model.predict(
-                img_cv2_denoised, imgsz=1400, conf=0.165, device=self.device, verbose=False
+                img_cv2_denoised, imgsz=1488, conf=0.165, device=self.device, verbose=False
             )[0]
 
             if visualize and vis_dir:
