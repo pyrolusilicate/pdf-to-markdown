@@ -290,7 +290,15 @@ class LayoutRouter:
 
         def priority(box):
             cls = self.model.names[int(box.cls[0])].lower()
-            return self._class_priority.get(cls, 3), float(box.conf[0])
+            base_prio = self._class_priority.get(cls, 3)
+            
+            # --- УБИЙЦА ФЕЙКОВЫХ ФИГУР ---
+            # Если YOLO придумал картинку/фигуру, но вес мусорный (< 0.4),
+            # роняем ее приоритет до 2 (ниже, чем у plain text). 
+            if cls in {"figure", "picture", "image"} and float(box.conf[0]) < 0.4:
+                base_prio = 2
+                
+            return base_prio, float(box.conf[0])
 
         sorted_boxes = sorted(boxes, key=priority, reverse=True)
         kept: list = []
@@ -388,17 +396,38 @@ class LayoutRouter:
             # --- ВНЕДРЕНИЕ ОЧИСТКИ ОТ ШУМА ---
             gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
             
-            # Проверяем страницу на наличие мусора
-            if self._is_image_noisy(gray, noise_threshold=3000):
-                # Страница грязная (как на скриншотах) -> применяем жесткую зачистку
-                mask = cv2.adaptiveThreshold(
-                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 15
-                )
-                kernel = np.ones((2, 2), np.uint8)
-                clean_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            is_noisy = self._is_image_noisy(gray, noise_threshold=7000)
+            if is_noisy:
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
                 
+                # 2. Ищем все независимые пятна (компоненты связности)
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+                
+                # 3. Достаем площади всех найденных пятен
+                areas = stats[:, cv2.CC_STAT_AREA]
+                
+                # --- ДИНАМИЧЕСКИЙ РАСЧЕТ ПОРОГА (АДАПТИВНЫЙ ЛАСТИК) ---
+                # Плотность шума прямо пропорциональна количеству мусорных компонент (num_labels).
+                # Делим общее число объектов на эмпирический коэффициент (например, 800).
+                # np.clip гарантирует, что мы не опустимся ниже 3 пикселей (на чистых листах)
+                # и не поднимемся выше 18 пикселей (чтобы не удалить запятые и точки на грязных).
+                
+                dynamic_threshold = num_labels / 6000.0
+                print(dynamic_threshold)
+                aria = int(np.clip(dynamic_threshold, 3, 18))
+                # --------------------------------------------------------
+                
+                # 4. Векторная магия Numpy
+                valid_labels_mask = (areas > aria).astype(np.uint8) * 255
+                valid_labels_mask[0] = 0  # Индекс 0 это фон, его тоже делаем черным в маске
+                
+                # Превращаем лейблы обратно в картинку-маску
+                clean_mask = valid_labels_mask[labels]
+                
+                # 5. Накладываем идеальный белый фон поверх шума
+                # Всё, что является полезным текстом, останется в ИДЕАЛЬНОМ оригинальном качестве
                 img_cv2_ready = img_cv2.copy()
-                img_cv2_ready[clean_mask == 255] = [255, 255, 255]
+                img_cv2_ready[clean_mask == 0] = [255, 255, 255]
             else:
                 # Страница чистая -> не трогаем пиксели, применяем только легкий блюр 
                 # для сглаживания возможных артефактов PDF-рендеринга
