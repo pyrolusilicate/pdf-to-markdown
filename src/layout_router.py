@@ -41,6 +41,8 @@ class LayoutRouter:
             "title": 10,
             "section-header": 9,
             "table": 8,
+            "table_merged": 8,       # <- ДОБАВИТЬ
+            "table_borderless": 8,   # <- ДОБАВИТЬ
             "figure": 7,
             "picture": 7,
             "table_caption": 6,
@@ -435,38 +437,15 @@ class LayoutRouter:
             # --- ВНЕДРЕНИЕ ОЧИСТКИ ОТ ШУМА ---
             gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
             
-            # УБИРАЕМ деструктивную бинаризацию Оцу перед YOLO.
-            # Оставляем оригинальное изображение, чтобы не ломать цветные плашки таблиц.
-            img_cv2_ready = img_cv2.copy()
+            # Детектируем, есть ли жесткий шум (используем твой же метод)
+            is_noisy = self._is_image_noisy(gray, noise_threshold=5000) 
+            if is_noisy:
+                # Медианный фильтр (kernel=3) — идеальное оружие против "соли и перца".
+                # Он стирает точки, но НЕ выжигает синие фоны таблиц.
+                img_cv2_ready = cv2.medianBlur(img_cv2, 3)
+            else:
+                img_cv2_ready = img_cv2.copy()
 
-            # # Повышаем порог входа, чтобы не трогать слегка пыльные, но читаемые листы
-            # is_noisy = self._is_image_noisy(gray, noise_threshold=8000) 
-            # if is_noisy:
-            #     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-                
-            #     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-            #     areas = stats[:, cv2.CC_STAT_AREA]
-                
-            #     # --- ЛЕЧИМ РАЗРЫВ ТАБЛИЦ ---
-            #     # Снижаем агрессию ластика. Кап в 5 пикселей убьет реальную "снежную" пыль (точки 2x2), 
-            #     # но 100% сохранит пунктирные линии таблиц, границы ячеек и знаки препинания.
-            #     dynamic_threshold = num_labels / 8000.0
-            #     aria = int(np.clip(dynamic_threshold, 2, 5)) 
-                
-            #     valid_labels_mask = (areas > aria).astype(np.uint8) * 255
-            #     valid_labels_mask[0] = 0  # Индекс 0 это фон
-                
-            #     clean_mask = valid_labels_mask[labels]
-                
-            #     img_cv2_ready = img_cv2.copy()
-            #     img_cv2_ready[clean_mask == 0] = [255, 255, 255]
-            # else:
-            #     # --- ЛЕЧИМ КРИВОЙ ДЕТЕКТ НА ЧИСТЫХ СТРАНИЦАХ ---
-            #     # Убиваем medianBlur! На чистых страницах он только портил резкость
-            #     # и сбивал YOLO с толку. Отдаем девственно чистую картинку.
-            #     img_cv2_ready = img_cv2.copy()
-            # =====================================================================
-            # =====================================================================
             # --- ВНЕДРЕНИЕ: MULTI-SCALE INFERENCE (ДВУХПРОХОДНЫЙ АНСАМБЛЬ) ---
             # =====================================================================
 
