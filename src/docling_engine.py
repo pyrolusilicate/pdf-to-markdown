@@ -2,14 +2,11 @@
 Docling DocumentConverter wrapper.
 
 Docling (IBM) — основной движок Fast Track. Делает всё сразу:
-  * layout-анализ (heron-101)
-  * извлечение текста с сохранением позиций (prov/bbox)
-  * TableFormer для структуры таблиц (state-of-art TEDS)
-  * EasyOCR (ru+en) для сканов
-  * рендер picture-объектов
-
-Singleton: первая инициализация подкачивает модели (~400MB), поэтому
-инстанс кэшируется на всё время жизни процесса.
+  - layout-анализ (heron-101)
+  - извлечение текста с сохранением позиций (prov/bbox)
+  - TableFormer для структуры таблиц (state-of-art TEDS)
+  - EasyOCR (ru+en) для сканов
+  - рендер picture-объектов
 """
 
 from __future__ import annotations

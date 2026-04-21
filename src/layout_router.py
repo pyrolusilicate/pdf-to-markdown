@@ -312,7 +312,7 @@ class LayoutRouter:
                         final.append(parsed_2400[i]["box"])
                         used_2400.add(i)
                     continue
-                # Лупа дала неполное покрытие → доверяем якорю 1280.
+                # Лупа дала неполное покрытие -> доверяем якорю 1280.
                 for i in internal:
                     used_2400.add(i)
             else:
@@ -635,7 +635,7 @@ def _visualize(
 
 
 def _doc_id_from_name(stem: str) -> str:
-    """document_051 → '51' (без ведущих нулей)."""
+    """document_051 -> '51' (без ведущих нулей)."""
     m = re.search(r"(\d+)", stem)
     return str(int(m.group(1))) if m else stem
 

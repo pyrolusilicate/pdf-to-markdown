@@ -1,25 +1,25 @@
 """
-Главный пайплайн: PDF → Markdown + images/ → submission.zip.
+Главный пайплайн: PDF -> Markdown + images/ -> submission.zip.
 
 Гибридная архитектура из трёх движков:
 
   Router     : DocLayout-YOLOv10 (layout_router.py).
                Определяет bbox блоков, отбрасывает вотермарки/колонтитулы/пустые
-               места, задаёт reading order (band → columns → top-down).
+               места, задаёт reading order (band -> columns -> top-down).
 
   Fast Track : Docling DocumentConverter — один convert(pdf) на документ.
                Отдаёт текст и таблицы; сопоставляем с YOLO-блоками по IoM,
                форматирование берём из реальных типов Docling-элементов
                (SectionHeaderItem, ListItem, TableItem и т.д.).
 
-  Fallback   : olmOCR-2-7B-1025 BF16 (Qwen2.5-VL) — crop YOLO-блока → markdown.
+  Fallback   : olmOCR-2-7B-1025 BF16 (Qwen2.5-VL) — crop YOLO-блока -> markdown.
                Срабатывает, если Docling не выдал контент (пустой OCR на скане,
                битый текстовый слой, figure с встроенным текстом).
 
-Маппинг YOLO-класса → обработчик:
-  title/section-header/list-item/text  → _process_text
-  table                                → _process_table
-  picture/figure/image                 → _process_figure (OCR + PNG)
+Маппинг YOLO-класса -> обработчик:
+  title/section-header/list-item/text  -> _process_text
+  table                                -> _process_table
+  picture/figure/image                 -> _process_figure (OCR + PNG)
 
 Использование (CLI):
   python src/pipeline.py --all
@@ -76,8 +76,8 @@ _WM_PREFIX_RE = re.compile(
     re.I | re.UNICODE,
 )
 
-# Внутренние Docling-ссылки на изображения (page_0_0_1280_960.png) нужно убирать
-# — наш экспорт использует собственные имена doc_<id>_image_<N>.png.
+# Внутренние Docling-ссылки на изображения (page_0_0_1280_960.png) нужно убирать,
+# так как наш экспорт использует собственные имена doc_<id>_image_<N>.png.
 _DOCLING_IMG_REF_RE = re.compile(
     r"!\[[^\]]*\]\(page_\d+[^\)]*\.(?:png|jpg|jpeg)\)", re.I
 )

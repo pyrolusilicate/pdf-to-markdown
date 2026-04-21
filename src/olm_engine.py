@@ -2,14 +2,14 @@
 olmOCR-2-7B-1025 wrapper (AllenAI, на базе Qwen2.5-VL-7B).
 
 Используется как fallback для двух сценариев:
-  * Docling вернул пустой/битый результат на блок (скан без OCR-слоя,
+  - Docling вернул пустой/битый результат на блок (скан без OCR-слоя,
     сильно повреждённая страница);
-  * определить содержимое figure-блока (таблица, текст, картинка).
+  - определить содержимое figure-блока (таблица, текст, картинка).
 
 Требования:
-  * torch>=2.5.1, transformers>=4.49, olmocr>=0.4 (для промпта);
-  * GPU с ≥14GB VRAM для BF16 (4090 — 24GB);
-  * flash-attn — опционально, ~2× ускорение decode.
+  - torch>=2.5.1, transformers>=4.49, olmocr>=0.4 (для промпта);
+  - GPU с >=14GB VRAM для BF16;
+  - flash-attn — опционально, ~2× ускорение decode.
 
 Для детерминизма использованы ``temperature=0.1`` + ``do_sample=False``.
 """
@@ -44,7 +44,7 @@ def _resize_longest(img: Image.Image, max_side: int) -> Image.Image:
 
 
 def _pil_to_b64(img: Image.Image) -> str:
-    """PIL.Image → base64-PNG ASCII-строка для chat-template image_url."""
+    """PIL.Image -> base64-PNG ASCII-строка для chat-template image_url."""
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
@@ -106,7 +106,7 @@ class OLMEngine:
 
     def page_to_markdown(self, pil_image: Image.Image) -> str:
         """
-        Распознаёт изображение → markdown (без YAML-frontmatter).
+        Распознаёт изображение -> markdown (без YAML-frontmatter).
 
         Изображение принудительно ресайзится к ``OLM_RENDER_SIDE`` (требование
         модели). Параметры генерации детерминированы, чтобы одинаковый вход
