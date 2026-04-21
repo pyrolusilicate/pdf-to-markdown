@@ -120,6 +120,7 @@ class Pipeline:
         # 4. Per-block: IoM-матч с Docling, fallback на olmOCR
         pdf_doc = fitz.open(pdf_path)
         self._doc_img_counter = 0   # счётчик реально сохранённых PNG для этого документа
+        self._used_item_ids: set[int] = set()  # Docling-элементы уже использованные в этом документе
         flat: list[tuple[str, str, int]] = []  # (yolo_type, md, page_num)
 
         try:
@@ -146,6 +147,9 @@ class Pipeline:
                     pass
         finally:
             pdf_doc.close()
+
+        # 4.5. Удаляем PNG и ссылки для figure-блоков без Рис. после них (шум/мусор)
+        flat = _drop_figures_without_caption(flat, self.images_dir)
 
         # 5. Склейка таблиц через разрыв страницы
         parts = _merge_cross_page_tables(flat)
@@ -203,14 +207,32 @@ class Pipeline:
         coords = block["coords"]
         btype = block["type"]
 
-        # 1. Docling Fast Track: собираем тексты по IoM-матчу
+        # 1. Docling Fast Track: собираем тексты и инферим форматирование из типов Docling
         matched = _match_items_by_iom(coords, page_items, kind_filter=("text",))
         text_parts = []
+        docling_heading_level: int = 0   # уровень из SectionHeaderItem.level
+        docling_is_list: bool = False    # хотя бы один ListItem среди матчей
+
         for _, _, item in matched:
+            item_id = id(item)
+            if item_id in self._used_item_ids:
+                continue  # этот Docling-элемент уже использован другим YOLO-блоком
             t = getattr(item, "text", "") or ""
-            t = _DOCLING_IMG_REF_RE.sub("", t).strip()  # убираем внутренние ссылки Docling
-            if t.strip():
-                text_parts.append(t.strip())
+            t = _DOCLING_IMG_REF_RE.sub("", t).strip()
+            if not t:
+                continue
+            self._used_item_ids.add(item_id)
+            text_parts.append(t)
+
+            # Читаем реальный тип Docling-элемента (первый матч определяет форматирование)
+            if docling_heading_level == 0 and not docling_is_list:
+                itype = type(item).__name__
+                if itype == "SectionHeaderItem":
+                    lvl = getattr(item, "level", None)
+                    docling_heading_level = int(lvl) if isinstance(lvl, int) and 1 <= lvl <= 6 else 2
+                elif itype == "ListItem":
+                    docling_is_list = True
+
         text = "\n".join(text_parts)
         text = filter_noise_lines(text, min_chars=3)
 
@@ -230,29 +252,36 @@ class Pipeline:
             return ""
 
         # 3. Markdown-форматирование
+        # Приоритет: реальный тип Docling → YOLO btype → эвристика по тексту
         heading_level = 0
+
         if btype == "title":
             heading_level = 1
+        elif docling_heading_level:
+            # Docling знает иерархию документа — доверяем ему
+            heading_level = docling_heading_level
         elif btype == "section-header":
-            # Берём уровень из Docling если есть (до 4 уровней по заданию)
-            docling_level = 0
-            for _, _, item in matched:
-                lvl = getattr(item, "level", None)
-                if lvl and isinstance(lvl, int) and 1 <= lvl <= 4:
-                    docling_level = lvl
-                    break
-            heading_level = docling_level if docling_level else 2
+            # Docling не вернул SectionHeaderItem → эвристика по тексту
+            first_line = text.splitlines()[0].strip() if text.strip() else ""
+            if re.match(r"^\d+[\d\.]*\s", first_line):
+                heading_level = 4  # пронумерованный пункт → ####
+            else:
+                heading_level = 3  # Глава / Раздел → ###
 
         if heading_level > 0:
-            # Если bbox захватил несколько Docling-элементов (заголовок + тело),
-            # отделяем первую строку как заголовок, остальные — как обычный текст
+            # Если bbox захватил заголовок + тело — разделяем
             lines = [l.strip() for l in text.splitlines() if l.strip()]
             if len(lines) > 1:
-                heading_md = format_text_markdown(lines[0], btype, heading_level)
-                body_text = "\n".join(lines[1:])
+                heading_md = format_text_markdown(lines[0], "section-header", heading_level)
+                body_text = _as_list_if_needed(lines[1:]) or "\n".join(lines[1:])
                 return f"{heading_md}\n\n{body_text}"
+            return format_text_markdown(text, "section-header", heading_level)
 
-        return format_text_markdown(text, btype, heading_level)
+        if docling_is_list or btype == "list-item":
+            return format_text_markdown(text, "list-item", 0)
+
+        # Обычный текст: пробуем определить список по содержимому
+        return _as_list_if_needed(text.splitlines()) or format_text_markdown(text, btype, 0)
 
     # ---- таблицы ------------------------------------------------------
 
@@ -268,13 +297,18 @@ class Pipeline:
         # 1. Docling TableFormer: матчим по IoM
         matched = _match_items_by_iom(coords, page_items, kind_filter=("table",))
         if matched:
-            # Берём таблицу с лучшим IoM (матч упорядочен по убыванию)
-            _, _, tbl_item = matched[0]
-            grid = _docling_table_to_grid(tbl_item)
-            if grid:
-                md = format_table_markdown(grid)
-                if md and _validate_table(md, ""):
-                    return md
+            # Берём первую не-использованную таблицу с лучшим IoM
+            for _, _, tbl_item in matched:
+                tbl_id = id(tbl_item)
+                if tbl_id in self._used_item_ids:
+                    continue
+                self._used_item_ids.add(tbl_id)
+                grid = _docling_table_to_grid(tbl_item)
+                if grid:
+                    md = format_table_markdown(grid)
+                    if md and _validate_table(md, ""):
+                        return md
+                break  # попробовали лучший матч — дальше не идём
 
         # 2. Fallback: olmOCR crop
         if self.olm is not None:
@@ -314,10 +348,12 @@ class Pipeline:
             return ""
 
         # Шумовое изображение (чёрные точки / пыль): почти полностью белое → пропускаем
+        _white_ratio = 0.0
         try:
             import numpy as np
             arr = np.array(pil.convert("L"))
-            if float(np.mean(arr > 230)) > 0.985:
+            _white_ratio = float(np.mean(arr > 230))
+            if _white_ratio > 0.98:
                 return ""
         except Exception:
             pass
@@ -347,6 +383,10 @@ class Pipeline:
         else:
             ocr_text = ""
 
+        # Пост-проверка: нет контента + преимущественно белое → шум, пропускаем
+        if not ocr_text and _white_ratio > 0.95:
+            return ""
+
         # Реальный рисунок: назначаем имя только сейчас (счётчик по реально сохранённым PNG)
         self._doc_img_counter += 1
         md_image_name = f"doc_{doc_id}_image_{self._doc_img_counter}.png"
@@ -360,14 +400,12 @@ class Pipeline:
             self._doc_img_counter -= 1  # откатываем счётчик — PNG не сохранился
             return ""
 
-        alt = _first_clean_line(ocr_text) or "image"
-        for ch in "![]()":
-            alt = alt.replace(ch, "")
-        alt = alt.strip()[:120] or "image"
-
+        # alt = "text" если есть OCR, "image" если просто картинка
+        alt = "text" if ocr_text else "image"
         image_md = f"![{alt}](images/{md_image_name})"
         if ocr_text:
-            return f"{image_md}\n{ocr_text}"
+            # Двойной перенос: Рис. caption (следующий блок) встанет между image_ref и OCR текстом
+            return f"{image_md}\n\n{ocr_text}"
         return image_md
 
     # ------------------------------------------------------------------
@@ -459,6 +497,9 @@ def _build_docling_index(doc) -> dict[int, list[tuple]]:
     return index
 
 
+_MAX_AREA_RATIO = 8.0  # Docling-item не должен быть > 8× больше YOLO-блока
+
+
 def _match_items_by_iom(
     block_bbox_px: list,
     page_items: list,
@@ -469,13 +510,23 @@ def _match_items_by_iom(
     """
     Возвращает [(iom_score, kind, item), ...] отсортированный по убыванию IoM,
     только элементы с IoM ≥ threshold и нужным kind.
+
+    Дополнительная защита: если Docling-item bbox > MAX_AREA_RATIO × YOLO-bbox,
+    это page-level / whole-section элемент — пропускаем (иначе один огромный item
+    склеивает весь текст страницы и дублируется через _used_item_ids на первый блок).
     """
-    bbox_a = tuple(block_bbox_px)  # type: ignore[arg-type]
+    x1a, y1a, x2a, y2a = block_bbox_px[:4]
+    yolo_area = max(1.0, (x2a - x1a) * (y2a - y1a))
+
     matches: list[tuple[float, str, object]] = []
     for bbox_b, kind, item in page_items:
         if kind not in kind_filter:
             continue
-        score = iom(bbox_a, bbox_b)
+        x1b, y1b, x2b, y2b = bbox_b[:4]
+        docling_area = max(1.0, (x2b - x1b) * (y2b - y1b))
+        if docling_area / yolo_area > _MAX_AREA_RATIO:
+            continue  # Docling-item на порядок больше YOLO-блока — не наш матч
+        score = iom(tuple(block_bbox_px), bbox_b)
         if score >= threshold:
             matches.append((score, kind, item))
     matches.sort(key=lambda x: -x[0])
@@ -639,6 +690,98 @@ def _merge_two_tables(t1: str, t2: str) -> str:
     return "\n".join(lines1 + data2)
 
 
+_RIS_CAPTION_RE = re.compile(r"^Рис\s*\.\s*\d+", re.I | re.UNICODE)
+_IMG_REF_LINE_RE = re.compile(r"^!\[(?:text|image)\]\(images/(doc_\d+_image_\d+\.png)\)", re.I)
+_IMG_ANY_REF_RE = re.compile(r"(images/)(doc_\d+_image_)(\d+)(\.png)", re.I)
+
+
+def _drop_figures_without_caption(
+    flat: list[tuple[str, str, int]],
+    images_dir: str,
+) -> list[tuple[str, str, int]]:
+    """
+    Удаляет PNG и ссылки для figure-блоков без подписи «Рис. N.» в следующих 3 блоках.
+    После удаления переименовывает оставшиеся PNG чтобы нумерация шла без пробелов (1,2,3…).
+    """
+    result = list(flat)
+
+    # Шаг 1: определяем какие PNG-ссылки удалять, а какие оставить
+    to_drop: set[str] = set()   # имена PNG которые надо удалить
+    to_keep: list[str] = []     # имена PNG в порядке появления (только выжившие)
+
+    for idx in range(len(result)):
+        ftype, fmd, _ = result[idx]
+        if ftype not in FIGURE_LABELS:
+            continue
+        first_line = fmd.strip().splitlines()[0].strip() if fmd.strip() else ""
+        m = _IMG_REF_LINE_RE.match(first_line)
+        if not m:
+            continue
+        png_name = m.group(1)
+
+        has_ris = any(
+            _RIS_CAPTION_RE.match(result[j][1].strip())
+            for j in range(idx + 1, min(idx + 4, len(result)))
+        )
+        if has_ris:
+            to_keep.append(png_name)
+        else:
+            to_drop.add(png_name)
+
+    # Шаг 2: строим карту переименования для выживших PNG (убираем пробелы в нумерации)
+    rename_map: dict[str, str] = {}
+    for new_idx, old_name in enumerate(to_keep, start=1):
+        # old_name: doc_5_image_3.png → new_name: doc_5_image_1.png (после удалений)
+        new_name = _IMG_ANY_REF_RE.sub(
+            lambda mo, n=new_idx: f"{mo.group(2)}{n}{mo.group(4)}",
+            f"images/{old_name}",
+        ).removeprefix("images/")
+        rename_map[old_name] = new_name
+
+    # Шаг 3: удаляем шумовые PNG
+    for png_name in to_drop:
+        try:
+            os.remove(os.path.join(images_dir, png_name))
+        except OSError:
+            pass
+
+    # Шаг 4: переименовываем выжившие PNG (в два прохода чтобы избежать коллизий)
+    tmp_names: dict[str, str] = {}
+    for old_name, new_name in rename_map.items():
+        if old_name == new_name:
+            continue
+        old_path = os.path.join(images_dir, old_name)
+        tmp_path = old_path + ".tmp_rename"
+        try:
+            os.rename(old_path, tmp_path)
+            tmp_names[tmp_path] = os.path.join(images_dir, new_name)
+        except OSError:
+            pass
+    for tmp_path, new_path in tmp_names.items():
+        try:
+            os.rename(tmp_path, new_path)
+        except OSError:
+            pass
+
+    # Шаг 5: обновляем ссылки в flat
+    def _remap_md(md: str, drop: set[str], rmap: dict[str, str]) -> str:
+        for old_name in drop:
+            # Убираем строку с удалённой ссылкой
+            md = "\n".join(
+                ln for ln in md.splitlines()
+                if old_name not in ln
+            )
+        for old_name, new_name in rmap.items():
+            md = md.replace(f"images/{old_name}", f"images/{new_name}")
+        return md.strip()
+
+    result = [
+        (ftype, _remap_md(fmd, to_drop, rename_map), fpage)
+        for ftype, fmd, fpage in result
+    ]
+    return result
+
+
 def _merge_cross_page_tables(flat: list[tuple[str, str, int]]) -> list[str]:
     """Два подряд *_TABLE НА РАЗНЫХ (соседних) СТРАНИЦАХ → склеиваем (разрыв страницы)."""
     result: list[str] = []
@@ -689,6 +832,39 @@ def _validate_table(md: str, ref_text: str) -> bool:
     if ref_text and cyrillic_ratio(ref_text) > 0.3 and cyrillic_ratio(md) < 0.1:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Форматирование списков
+# ---------------------------------------------------------------------------
+
+# Признаки пункта списка: маркер (•▪▸-*) ИЛИ цифра/буква с точкой/скобкой
+_LIST_BULLET_RE = re.compile(r"^[•▪▸\-\*]\s")
+_LIST_ORDERED_RE = re.compile(r"^(?:\d+[\d\.]*[\.\)]\s|\([а-яёa-z\d]\)\s|[а-яёa-z]\)\s)")
+
+
+def _as_list_if_needed(lines: list[str] | str) -> str:
+    """
+    Если строки выглядят как пункты списка — форматируем в markdown-список с «- ».
+    Возвращает «» если список не распознан (вызывающий применяет другой форматтер).
+    """
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    non_empty = [l.strip() for l in lines if l.strip()]
+    if len(non_empty) < 2:
+        return ""
+    # Список: ВСЕ строки должны быть признаны пунктами (строгий критерий)
+    is_item = [bool(_LIST_BULLET_RE.match(l) or _LIST_ORDERED_RE.match(l)) for l in non_empty]
+    if sum(is_item) < len(non_empty):
+        return ""
+    result = []
+    for line in non_empty:
+        if _LIST_BULLET_RE.match(line):
+            # Нормализуем маркер в «- »
+            result.append("- " + line[2:])
+        else:
+            result.append(f"- {line}")
+    return "\n".join(result)
 
 
 # ---------------------------------------------------------------------------
@@ -783,7 +959,45 @@ def _postprocess_document(text: str) -> str:
         deduped.append(blk)
         if norm:
             prev_block = norm
-    text = "\n\n".join(deduped)
+    blocks = deduped
+
+    # 3.5. Перестановка: ![text/image](...) → OCR-текст → Рис. N.
+    #      → должно быть: ![text/image](...) → Рис. N. → OCR-текст
+    _RIS_RE = re.compile(r"^Рис\s*\.\s*\d+", re.I | re.UNICODE)
+    _IMG_BLOCK_RE = re.compile(r"^!\[(?:text|image)\]\(images/", re.I)
+    reordered: list[str] = []
+    i = 0
+    while i < len(blocks):
+        b = blocks[i].strip()
+        if (
+            i + 2 < len(blocks)
+            and _IMG_BLOCK_RE.match(b)
+            and not _RIS_RE.match(blocks[i + 1].strip())
+            and _RIS_RE.match(blocks[i + 2].strip())
+        ):
+            # Ставим Рис. перед OCR-текстом
+            reordered.extend([blocks[i], blocks[i + 2], blocks[i + 1]])
+            i += 3
+        else:
+            reordered.append(blocks[i])
+            i += 1
+
+    # 3.6. Удаляем ссылки на картинки без Рис. после них — это шум/мусор
+    #      Правило: в этом наборе документов каждая значимая картинка имеет подпись Рис. N.
+    filtered: list[str] = []
+    i = 0
+    while i < len(reordered):
+        b = reordered[i].strip()
+        if _IMG_BLOCK_RE.match(b):
+            next_b = reordered[i + 1].strip() if i + 1 < len(reordered) else ""
+            if _RIS_RE.match(next_b):
+                filtered.append(reordered[i])  # есть Рис. → оставляем картинку
+            # иначе ссылку выбрасываем; OCR-текст (если есть дальше) сохранится
+        else:
+            filtered.append(reordered[i])
+        i += 1
+
+    text = "\n\n".join(filtered)
 
     # 4. Дубли соседних заголовков
     lines = text.splitlines()

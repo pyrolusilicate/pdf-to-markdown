@@ -125,8 +125,6 @@ class LayoutRouter:
 
         pdf_doc = fitz.open(pdf_path)
         pages_out: list[dict] = []
-        global_img_counter = 1  # не используется для имён, только для _find_missed_rasters совместимости
-
         try:
             for page_idx, page in enumerate(pdf_doc):
                 page_num_1 = page_idx + 1
