@@ -125,7 +125,7 @@ class LayoutRouter:
 
         pdf_doc = fitz.open(pdf_path)
         pages_out: list[dict] = []
-        global_img_counter = 1
+        global_img_counter = 1  # не используется для имён, только для _find_missed_rasters совместимости
 
         try:
             for page_idx, page in enumerate(pdf_doc):
@@ -174,8 +174,7 @@ class LayoutRouter:
 
                     md_image_name: Optional[str] = None
                     if label in _FIGURE_LABELS:
-                        md_image_name = f"doc_{doc_id}_image_{global_img_counter}.png"
-                        global_img_counter += 1
+                        md_image_name = "__figure__"  # имя назначит pipeline при реальном сохранении
                     # Все блоки попадают в saved_coords, чтобы _find_missed_rasters
                     # не добавлял растр поверх уже покрытой таблицей/текстом области
                     saved_coords.append(coords)
@@ -189,11 +188,10 @@ class LayoutRouter:
 
                 # Растровые объекты пропущенные YOLO
                 missed = _find_missed_rasters(
-                    page, pil_img, sorted_boxes, saved_coords, doc_id, global_img_counter
+                    page, pil_img, sorted_boxes, saved_coords
                 )
                 for blk in missed:
                     blocks.append(blk)
-                    global_img_counter += 1
 
                 pages_out.append({
                     "page_num": page_num_1,
@@ -491,12 +489,9 @@ def _find_missed_rasters(
     pil_img: Image.Image,
     sorted_boxes: list,
     saved_coords: list[list[int]],
-    doc_id: str,
-    img_counter: int,
 ) -> list[dict]:
     """Возвращает блоки type='picture' для растровых объектов PDF пропущенных YOLO."""
     results: list[dict] = []
-    counter = img_counter
     page_area_pt = page.rect.width * page.rect.height
 
     for img_info in page.get_image_info(xrefs=True):
@@ -537,9 +532,8 @@ def _find_missed_rasters(
             "type": "picture",
             "coords": mc,
             "conf": 1.0,
-            "md_image_name": f"doc_{doc_id}_image_{counter}.png",
+            "md_image_name": "__figure__",  # имя назначит pipeline при реальном сохранении
         })
-        counter += 1
 
     return results
 

@@ -37,7 +37,6 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import LAYOUT_DPI
 from content_extractor import (
     crop_pdf_bbox,
     cyrillic_ratio,
@@ -49,7 +48,7 @@ from content_extractor import (
 )
 from coord_projection import iom, points_to_pixels
 from device import setup_environment
-from layout_router import FIGURE_LABELS, TABLE_LABELS, TEXT_LABELS, LayoutRouter
+from layout_router import FIGURE_LABELS, TABLE_LABELS, LayoutRouter
 
 setup_environment()
 
@@ -120,6 +119,7 @@ class Pipeline:
 
         # 4. Per-block: IoM-матч с Docling, fallback на olmOCR
         pdf_doc = fitz.open(pdf_path)
+        self._doc_img_counter = 0   # счётчик реально сохранённых PNG для этого документа
         flat: list[tuple[str, str, int]] = []  # (yolo_type, md, page_num)
 
         try:
@@ -183,7 +183,6 @@ class Pipeline:
         doc_id: str,
     ) -> str:
         btype = block["type"]
-        coords = block["coords"]  # px YOLO
 
         if btype in FIGURE_LABELS:
             return self._process_figure(block, page_num_0, pdf_doc, doc_id)
@@ -305,11 +304,11 @@ class Pipeline:
         doc_id: str,
     ) -> str:
         coords = block["coords"]
-        md_image_name = block.get("md_image_name")
-        if not md_image_name:
+        # md_image_name от роутера — всегда "__figure__" (имя назначается ниже при сохранении)
+        if not block.get("md_image_name"):
             return ""
 
-        # Рендерим bbox в PIL для сохранения и OCR
+        # Рендерим bbox в PIL для OCR и (возможно) сохранения
         pil = crop_pdf_bbox(pdf_doc, page_num_0, coords, max_side=OLM_RENDER_SIDE, pad_pts=0.0)
         if pil is None:
             return ""
@@ -323,7 +322,7 @@ class Pipeline:
         except Exception:
             pass
 
-        # Сначала пробуем olmOCR — если нашли таблицу, возвращаем только текст (no image ref)
+        # Сначала olmOCR — определяем тип контента
         if self.olm is not None:
             try:
                 raw = self.olm.page_to_markdown(pil).strip()
@@ -341,14 +340,16 @@ class Pipeline:
                 cleaned = filter_noise_lines(raw[:800], min_chars=3)
                 if len(cleaned.split()) > 20:
                     return cleaned
-                # Мало слов → подпись/метка на реальном рисунке: сохраняем OCR-текст
+                # Мало слов → подпись на реальном рисунке
                 ocr_text = cleaned
             else:
                 ocr_text = ""
         else:
             ocr_text = ""
 
-        # Таблицы нет и текст короткий → реальный рисунок, сохраняем PNG и создаём image ref
+        # Реальный рисунок: назначаем имя только сейчас (счётчик по реально сохранённым PNG)
+        self._doc_img_counter += 1
+        md_image_name = f"doc_{doc_id}_image_{self._doc_img_counter}.png"
         dest = os.path.join(self.images_dir, md_image_name)
         try:
             thumb = pil.convert("RGB")
@@ -356,6 +357,7 @@ class Pipeline:
             thumb.save(dest, "PNG", optimize=True, compress_level=9)
         except Exception as exc:  # noqa: BLE001
             print(f"  [WARN] save figure: {exc}")
+            self._doc_img_counter -= 1  # откатываем счётчик — PNG не сохранился
             return ""
 
         alt = _first_clean_line(ocr_text) or "image"
