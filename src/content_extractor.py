@@ -32,7 +32,7 @@ from config import (
 _NUMERIC_RE = re.compile(r"^[\d\s.,+\-/%№()]+$")
 _STAMP_FRAG_RE = re.compile(r"^[А-ЯЁA-Z]{2,6}$")
 _WATERMARK_RE = re.compile(
-    r"^(ЧЕРНОВИК|DRAFT|CONFIDENTIAL|КОНФИДЕНЦИАЛЬНО|НЕ\s+ДЛЯ\s+РАСПРОСТРАНЕНИЯ)[\s\d\W]*$",
+    r"^(ЧЕРНОВИК|DRAFT|CONFIDENTIAL|ОБРАЗЕЦ|КОНФИДЕНЦИАЛЬНО|НЕ\s+ДЛЯ\s+РАСПРОСТРАНЕНИЯ)[\s\d\W]*$",
     re.I | re.UNICODE,
 )
 _CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
@@ -229,13 +229,31 @@ def format_text_markdown(text: str, block_type: str, heading_level: int = 0) -> 
     if block_type == "list-item":
         out = []
         for line in text.splitlines():
-            line = line.strip()
-            if not line:
+            # Если строка пустая, пропускаем, но не используем strip() на самой line,
+            # чтобы не потерять отступы
+            if not line.strip():
                 continue
-            if re.match(r"^[•▪▸\-\*]\s", line) or re.match(r"^\d+[.)]\s", line):
-                out.append(line)
+            
+            # Сохраняем оригинальный отступ
+            indent_match = re.match(r"^(\s*)", line)
+            indent = indent_match.group(1) if indent_match else ""
+            clean_line = line.lstrip() # Строка без отступов для проверок
+            
+            # Если это реальный маркер списка — нормализуем
+            if re.match(r"^[•▪◦▸\-\*]\s", clean_line):
+                # Страховка: если пробелов нет, но маркер вложенный, делаем отступ сами
+                if not indent:
+                    if clean_line.startswith('◦'):
+                        indent = "  "
+                    elif clean_line.startswith('▪') or clean_line.startswith('▸'):
+                        indent = "    "
+                out.append(f"{indent}- {clean_line[2:]}")
+                
+            # Если начинается с цифры или буквы со скобкой то без тире
+            elif re.match(r"^\d", clean_line) or re.match(r"^[A-Za-zА-Яа-яЁё]\)", clean_line):
+                out.append(f"{indent}{clean_line}")
             else:
-                out.append(f"- {line}")
+                out.append(f"{indent}- {clean_line}")
         return "\n".join(out)
 
     return text
