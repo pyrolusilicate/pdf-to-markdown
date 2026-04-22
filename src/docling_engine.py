@@ -34,8 +34,8 @@ class DoclingEngine:
         Конфигурирует DocumentConverter.
 
         Настройки подобраны под задачу: RU+EN OCR, TableFormer с cell-matching,
-        сохранение картинок как PIL (generate_picture_images), масштаб 2× для
-        читаемых превью.
+        сохранение картинок как PIL (generate_picture_images), масштаб в 2 раза
+        больше для читаемых превью.
         """
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import (
