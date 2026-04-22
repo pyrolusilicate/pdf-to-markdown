@@ -9,7 +9,7 @@ olmOCR-2-7B-1025 wrapper (AllenAI, на базе Qwen2.5-VL-7B).
 Требования:
   - torch>=2.5.1, transformers>=4.49, olmocr>=0.4 (для промпта);
   - GPU с >=14GB VRAM для BF16;
-  - flash-attn — опционально, ~2× ускорение decode.
+  - flash-attn — опционально, ~2 ускорение decode.
 
 Для детерминизма использованы ``temperature=0.1`` + ``do_sample=False``.
 """
